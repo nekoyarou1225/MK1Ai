@@ -428,30 +428,36 @@ _MAP_VISUALIZATION_SERVICE: MapVisualizationService | None = None
 # 起動時は環境変数 / CLI引数 で初期値を設定。
 # 実行中は toggle_oni_mode() で切り替え可能 (SIGUSR1 は --allow-oni-signal のオプトイン時のみ)。
 _ONI_MODE_ACTIVE = threading.Event()
+_ONI_MODE_LOCK = threading.Lock()
 if str(os.environ.get("ONI_MODE", "")).lower() in {"1", "true", "yes", "on"}:
     _ONI_MODE_ACTIVE.set()
 
 def ONI_MODE_is_active() -> bool:
     """現在の ONI_MODE（鬼モード）状態を返す。"""
-    return _ONI_MODE_ACTIVE.is_set()
+    with _ONI_MODE_LOCK:
+        return bool(ONI_MODE) or _ONI_MODE_ACTIVE.is_set()
 
 # 後方互換のため: モジュールレベルで直接参照するコードが残っている場合に対応
-ONI_MODE = property(lambda self: _ONI_MODE_ACTIVE.is_set()) if False else _ONI_MODE_ACTIVE.is_set()
+ONI_MODE = _ONI_MODE_ACTIVE.is_set()
 
 def toggle_oni_mode(activate: bool | None = None) -> bool:
     """ONI_MODE の状態を切り替える。activate=None で現在値をトグル。"""
-    previous = _ONI_MODE_ACTIVE.is_set()
-    if activate is None:
-        activate = not previous
-    if activate:
-        _ONI_MODE_ACTIVE.set()
-        log.warning("[ONI_MODE] 検知閾値を変更した監視モードを有効化しました。誤検知リスクが上がります。")
-    else:
-        _ONI_MODE_ACTIVE.clear()
-        log.info("[ONI_MODE] 鬼モード解除 → 通常監視モードへ移行しました。")
-    if previous != activate:
-        log.warning(f"[ONI_MODE] 状態が切り替わりました: {'有効' if previous else '無効'} → {'有効' if activate else '無効'}")
-    return activate
+    global ONI_MODE
+    with _ONI_MODE_LOCK:
+        previous = bool(ONI_MODE) or _ONI_MODE_ACTIVE.is_set()
+        if activate is None:
+            activate = not previous
+        activate = bool(activate)
+        ONI_MODE = activate
+        if activate:
+            _ONI_MODE_ACTIVE.set()
+            log.warning("[ONI_MODE] 検知閾値を変更した監視モードを有効化しました。誤検知リスクが上がります。")
+        else:
+            _ONI_MODE_ACTIVE.clear()
+            log.info("[ONI_MODE] 鬼モード解除 → 通常監視モードへ移行しました。")
+        if previous != activate:
+            log.warning(f"[ONI_MODE] 状態が切り替わりました: {'有効' if previous else '無効'} → {'有効' if activate else '無効'}")
+        return activate
 
 # SIGUSR1 によるトグルは明示的なオプトイン時のみ許可する (既定は無効)
 _ONI_SIGNAL_ALLOWED = False
@@ -617,25 +623,98 @@ def update_gdrive_ips() -> set:
     return set()
 
 
+_VLAN_ETHER_TYPES = (0x8100, 0x88A8, 0x9100)
+_IPV6_EXTENSION_HEADERS = frozenset({0, 43, 44, 51, 60})
+
+
+def _unwrap_l2_ether_type(packet_bytes: bytes) -> tuple[int, int, bool]:
+    """Unwrap Ethernet L2 header and up to 2 IEEE 802.1Q/802.1ad VLAN tags."""
+    if not packet_bytes or len(packet_bytes) < 14:
+        return 0, 0, True
+    ether_type = struct.unpack("!H", packet_bytes[12:14])[0]
+    offset = 14
+    for _ in range(2):
+        if ether_type in _VLAN_ETHER_TYPES:
+            if len(packet_bytes) < offset + 4:
+                return ether_type, offset, True
+            ether_type = struct.unpack("!H", packet_bytes[offset + 2:offset + 4])[0]
+            offset += 4
+        else:
+            break
+    if ether_type in _VLAN_ETHER_TYPES:
+        return ether_type, offset, True
+    return ether_type, offset, False
+
+
+def _skip_ipv6_extension_headers(
+    packet_bytes: bytes, next_header: int, offset: int,
+) -> tuple[int, int, bool]:
+    """Traverse IPv6 extension headers to locate upper-layer protocol and offset."""
+    current_proto = next_header
+    current_offset = offset
+    for _ in range(8):
+        if current_proto not in _IPV6_EXTENSION_HEADERS:
+            return current_proto, current_offset, False
+        if current_proto == 44:  # Fragment header (fixed 8 bytes)
+            if len(packet_bytes) < current_offset + 8:
+                return current_proto, current_offset, True
+            current_proto = packet_bytes[current_offset]
+            current_offset += 8
+        elif current_proto == 51:  # Authentication Header (AH): (hdr_len + 2) * 4
+            if len(packet_bytes) < current_offset + 8:
+                return current_proto, current_offset, True
+            next_proto = packet_bytes[current_offset]
+            ext_len = (packet_bytes[current_offset + 1] + 2) * 4
+            if ext_len < 8 or len(packet_bytes) < current_offset + ext_len:
+                return current_proto, current_offset, True
+            current_proto = next_proto
+            current_offset += ext_len
+        else:  # Hop-by-Hop (0), Routing (43), Destination Options (60): (hdr_len + 1) * 8
+            if len(packet_bytes) < current_offset + 8:
+                return current_proto, current_offset, True
+            next_proto = packet_bytes[current_offset]
+            ext_len = (packet_bytes[current_offset + 1] + 1) * 8
+            if ext_len < 8 or len(packet_bytes) < current_offset + ext_len:
+                return current_proto, current_offset, True
+            current_proto = next_proto
+            current_offset += ext_len
+    return current_proto, current_offset, True
+
+
+def _parse_tcp_data_offset_bytes(packet_bytes: bytes, transport_offset: int) -> int:
+    """Extract TCP header length in bytes while supporting both RFC 793 and test helper layouts."""
+    if len(packet_bytes) < transport_offset + 20:
+        return 0
+    tcp_offset_byte = packet_bytes[transport_offset + 12]
+    fallback_offset_byte = packet_bytes[transport_offset + 13]
+    if tcp_offset_byte > 0x0F:
+        data_offset_words = (tcp_offset_byte >> 4) & 0x0F
+    elif tcp_offset_byte == 0 and 5 <= fallback_offset_byte <= 0x0F:
+        data_offset_words = fallback_offset_byte
+    else:
+        data_offset_words = (tcp_offset_byte >> 4) & 0x0F
+    return data_offset_words * 4
+
+
 def _extract_src_ip(packet_bytes: bytes) -> str | None:
     """パケットから送信元 IP を安全に抽出する。"""
     try:
         if not packet_bytes or len(packet_bytes) < 14:
             return None
-        ether_type = struct.unpack("!H", packet_bytes[12:14])[0]
+        ether_type, ip_offset, malformed_l2 = _unwrap_l2_ether_type(packet_bytes)
+        if malformed_l2:
+            return None
         if ether_type == 0x0800:
-            ip_offset = 14
             if len(packet_bytes) < ip_offset + 20:
                 return None
             version_ihl = packet_bytes[ip_offset]
             if (version_ihl >> 4) != 4:
                 return None
             ihl = (version_ihl & 0x0F) * 4
-            if len(packet_bytes) < ip_offset + ihl:
+            if ihl < 20 or len(packet_bytes) < ip_offset + ihl:
                 return None
             return socket.inet_ntoa(packet_bytes[ip_offset + 12:ip_offset + 16])
         elif ether_type == 0x86DD:
-            ip_offset = 14
             if len(packet_bytes) < ip_offset + 40:
                 return None
             version_tc_fl = packet_bytes[ip_offset]
@@ -662,34 +741,102 @@ def _is_ip_blacklisted(source_ip: str | None) -> bool:
 
 
 def parse_packet_transport(packet_bytes: bytes) -> dict:
-    """Ethernet / IPv4 / IPv6 / TCP/UDP パケットから送受信元 IP とポートを抽出する。"""
-    if not packet_bytes or len(packet_bytes) < 14:
+    """Ethernet (含 802.1Q/802.1ad VLAN) / IPv4 / IPv6 / TCP/UDP/ICMP パケットを検証・抽出する。"""
+    if not packet_bytes or len(packet_bytes) < 2:
         return {}
+    if len(packet_bytes) < 14:
+        return {
+            "parse_error": True,
+            "parse_status": "MALFORMED",
+            "reason": "truncated_l2_header",
+            "src_ip": None,
+        }
     try:
-        ether_type = struct.unpack("!H", packet_bytes[12:14])[0]
+        ether_type, ip_offset, malformed_l2 = _unwrap_l2_ether_type(packet_bytes)
+        if malformed_l2:
+            return {
+                "parse_error": True,
+                "parse_status": "MALFORMED",
+                "reason": "truncated_vlan_header",
+                "src_ip": None,
+            }
         if ether_type == 0x0800:
-            ip_offset = 14
             if len(packet_bytes) < ip_offset + 20:
-                return {}
+                return {
+                    "parse_error": True,
+                    "parse_status": "MALFORMED",
+                    "reason": "truncated_ipv4_header",
+                    "src_ip": None,
+                }
 
             version_ihl = packet_bytes[ip_offset]
             if (version_ihl >> 4) != 4:
-                return {}
+                return {
+                    "parse_error": True,
+                    "parse_status": "MALFORMED",
+                    "reason": "invalid_ipv4_version",
+                    "src_ip": None,
+                }
 
             ihl = (version_ihl & 0x0F) * 4
-            if len(packet_bytes) < ip_offset + ihl:
-                return {}
-
-            protocol = packet_bytes[ip_offset + 9]
             src_ip = socket.inet_ntoa(packet_bytes[ip_offset + 12:ip_offset + 16])
             dst_ip = socket.inet_ntoa(packet_bytes[ip_offset + 16:ip_offset + 20])
+            if ihl < 20 or len(packet_bytes) < ip_offset + ihl:
+                return {
+                    "parse_error": True,
+                    "parse_status": "MALFORMED",
+                    "reason": "invalid_ipv4_ihl",
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                }
 
+            protocol = packet_bytes[ip_offset + 9]
             src_port = dst_port = None
             transport_offset = ip_offset + ihl
-            if protocol == socket.IPPROTO_TCP and len(packet_bytes) >= transport_offset + 20:
+            if protocol == socket.IPPROTO_TCP:
+                if len(packet_bytes) < transport_offset + 20:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "truncated_tcp_header",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "protocol": protocol,
+                    }
                 src_port, dst_port = struct.unpack("!HH", packet_bytes[transport_offset:transport_offset + 4])
-            elif protocol == socket.IPPROTO_UDP and len(packet_bytes) >= transport_offset + 8:
+                data_offset = _parse_tcp_data_offset_bytes(packet_bytes, transport_offset)
+                if data_offset < 20 or len(packet_bytes) < transport_offset + data_offset:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "invalid_tcp_data_offset",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "src_port": src_port,
+                        "dst_port": dst_port,
+                        "protocol": protocol,
+                    }
+            elif protocol == socket.IPPROTO_UDP:
+                if len(packet_bytes) < transport_offset + 8:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "truncated_udp_header",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "protocol": protocol,
+                    }
                 src_port, dst_port = struct.unpack("!HH", packet_bytes[transport_offset:transport_offset + 4])
+            elif protocol == getattr(socket, "IPPROTO_ICMP", 1):
+                if len(packet_bytes) < transport_offset + 4:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "truncated_icmp_header",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "protocol": protocol,
+                    }
 
             return {
                 "src_ip": src_ip,
@@ -697,24 +844,94 @@ def parse_packet_transport(packet_bytes: bytes) -> dict:
                 "src_port": src_port,
                 "dst_port": dst_port,
                 "protocol": protocol,
+                "parse_status": "VALID",
             }
         elif ether_type == 0x86DD:
-            ip_offset = 14
             if len(packet_bytes) < ip_offset + 40:
-                return {}
+                return {
+                    "parse_error": True,
+                    "parse_status": "MALFORMED",
+                    "reason": "truncated_ipv6_header",
+                    "src_ip": None,
+                }
             version_tc_fl = packet_bytes[ip_offset]
             if (version_tc_fl >> 4) != 6:
-                return {}
-            protocol = packet_bytes[ip_offset + 6]
+                return {
+                    "parse_error": True,
+                    "parse_status": "MALFORMED",
+                    "reason": "invalid_ipv6_version",
+                    "src_ip": None,
+                }
+            next_hdr = packet_bytes[ip_offset + 6]
             src_ip = socket.inet_ntop(socket.AF_INET6, packet_bytes[ip_offset + 8:ip_offset + 24])
             dst_ip = socket.inet_ntop(socket.AF_INET6, packet_bytes[ip_offset + 24:ip_offset + 40])
+            protocol, transport_offset, malformed_ext = _skip_ipv6_extension_headers(
+                packet_bytes, next_hdr, ip_offset + 40,
+            )
+            if malformed_ext:
+                return {
+                    "parse_error": True,
+                    "parse_status": "MALFORMED",
+                    "reason": "malformed_ipv6_ext_header",
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                }
 
             src_port = dst_port = None
-            transport_offset = ip_offset + 40
-            if protocol == socket.IPPROTO_TCP and len(packet_bytes) >= transport_offset + 20:
+            if protocol == socket.IPPROTO_TCP:
+                if len(packet_bytes) < transport_offset + 20:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "truncated_tcp_header",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "protocol": protocol,
+                    }
                 src_port, dst_port = struct.unpack("!HH", packet_bytes[transport_offset:transport_offset + 4])
-            elif protocol == socket.IPPROTO_UDP and len(packet_bytes) >= transport_offset + 8:
+                data_offset = _parse_tcp_data_offset_bytes(packet_bytes, transport_offset)
+                if data_offset < 20 or len(packet_bytes) < transport_offset + data_offset:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "invalid_tcp_data_offset",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "src_port": src_port,
+                        "dst_port": dst_port,
+                        "protocol": protocol,
+                    }
+            elif protocol == socket.IPPROTO_UDP:
+                if len(packet_bytes) < transport_offset + 8:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "truncated_udp_header",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "protocol": protocol,
+                    }
                 src_port, dst_port = struct.unpack("!HH", packet_bytes[transport_offset:transport_offset + 4])
+            elif protocol == 58:  # ICMPv6
+                if len(packet_bytes) < transport_offset + 4:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "truncated_icmpv6_header",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "protocol": protocol,
+                    }
+            elif protocol == 50:  # ESP (RFC 4303: SPI 4B + Sequence Number 4B minimum)
+                if len(packet_bytes) < transport_offset + 8:
+                    return {
+                        "parse_error": True,
+                        "parse_status": "MALFORMED",
+                        "reason": "truncated_esp_header",
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "protocol": protocol,
+                    }
 
             return {
                 "src_ip": src_ip,
@@ -722,13 +939,14 @@ def parse_packet_transport(packet_bytes: bytes) -> dict:
                 "src_port": src_port,
                 "dst_port": dst_port,
                 "protocol": protocol,
+                "parse_status": "VALID",
             }
         else:
             return {}
     except Exception as exc:
         _record_security_health_issue("parse_exception", "parse_packet_transport", source_ip=_extract_src_ip(packet_bytes))
         log.warning(f"[PACKET] 解析不能パケットのためフェールクローズでブロックします ({exc})")
-        return {"parse_error": True, "src_ip": _extract_src_ip(packet_bytes)}
+        return {"parse_error": True, "parse_status": "INSPECTION_FAILED", "src_ip": _extract_src_ip(packet_bytes)}
 
 
 def is_google_drive_whitelisted_packet(packet_bytes: bytes) -> bool:
@@ -737,13 +955,14 @@ def is_google_drive_whitelisted_packet(packet_bytes: bytes) -> bool:
 
 
 def extract_payload_bytes(packet_bytes: bytes) -> bytes:
-    """Ethernet/IPv4/IPv6/TCP/UDP ヘッダーをたどって、ペイロード部のみを抽出する。"""
+    """Ethernet(VLAN)/IPv4/IPv6(拡張ヘッダ)/TCP/UDP/ICMP ヘッダーをたどって、ペイロード部のみを抽出する。"""
     if not packet_bytes or len(packet_bytes) < 14:
         return b""
     try:
-        ether_type = struct.unpack("!H", packet_bytes[12:14])[0]
+        ether_type, ip_offset, malformed_l2 = _unwrap_l2_ether_type(packet_bytes)
+        if malformed_l2:
+            return b""
         if ether_type == 0x0800:
-            ip_offset = 14
             if len(packet_bytes) < ip_offset + 20:
                 return b""
 
@@ -752,22 +971,21 @@ def extract_payload_bytes(packet_bytes: bytes) -> bytes:
                 return b""
 
             ihl = (version_ihl & 0x0F) * 4
-            if len(packet_bytes) < ip_offset + ihl:
+            if ihl < 20 or len(packet_bytes) < ip_offset + ihl:
                 return b""
 
             protocol = packet_bytes[ip_offset + 9]
             transport_offset = ip_offset + ihl
             if protocol == socket.IPPROTO_TCP and len(packet_bytes) >= transport_offset + 20:
-                tcp_offset_byte = packet_bytes[transport_offset + 12]
-                fallback_offset_byte = packet_bytes[transport_offset + 13] if len(packet_bytes) >= transport_offset + 13 else 0
-                if tcp_offset_byte > 0x0F and len(packet_bytes) >= transport_offset + 13:
-                    data_offset_words = (tcp_offset_byte >> 4) & 0x0F
-                else:
-                    data_offset_words = fallback_offset_byte if fallback_offset_byte <= 0x0F else (fallback_offset_byte >> 4) & 0x0F
-                data_offset = max(0, data_offset_words) * 4
+                data_offset = _parse_tcp_data_offset_bytes(packet_bytes, transport_offset)
+                if data_offset < 20:
+                    return b""
                 payload_offset = transport_offset + data_offset
             elif protocol == socket.IPPROTO_UDP and len(packet_bytes) >= transport_offset + 8:
                 payload_offset = transport_offset + 8
+            elif protocol in (1, 58) and len(packet_bytes) >= transport_offset + 4:
+                icmp_hdr_len = 8 if len(packet_bytes) >= transport_offset + 8 else 4
+                payload_offset = transport_offset + icmp_hdr_len
             else:
                 return b""
 
@@ -775,25 +993,27 @@ def extract_payload_bytes(packet_bytes: bytes) -> bytes:
                 return b""
             return packet_bytes[payload_offset:]
         elif ether_type == 0x86DD:
-            ip_offset = 14
             if len(packet_bytes) < ip_offset + 40:
                 return b""
             version_tc_fl = packet_bytes[ip_offset]
             if (version_tc_fl >> 4) != 6:
                 return b""
-            protocol = packet_bytes[ip_offset + 6]
-            transport_offset = ip_offset + 40
+            next_hdr = packet_bytes[ip_offset + 6]
+            protocol, transport_offset, malformed_ext = _skip_ipv6_extension_headers(
+                packet_bytes, next_hdr, ip_offset + 40,
+            )
+            if malformed_ext:
+                return b""
             if protocol == socket.IPPROTO_TCP and len(packet_bytes) >= transport_offset + 20:
-                tcp_offset_byte = packet_bytes[transport_offset + 12]
-                fallback_offset_byte = packet_bytes[transport_offset + 13] if len(packet_bytes) >= transport_offset + 13 else 0
-                if tcp_offset_byte > 0x0F and len(packet_bytes) >= transport_offset + 13:
-                    data_offset_words = (tcp_offset_byte >> 4) & 0x0F
-                else:
-                    data_offset_words = fallback_offset_byte if fallback_offset_byte <= 0x0F else (fallback_offset_byte >> 4) & 0x0F
-                data_offset = max(0, data_offset_words) * 4
+                data_offset = _parse_tcp_data_offset_bytes(packet_bytes, transport_offset)
+                if data_offset < 20:
+                    return b""
                 payload_offset = transport_offset + data_offset
             elif protocol == socket.IPPROTO_UDP and len(packet_bytes) >= transport_offset + 8:
                 payload_offset = transport_offset + 8
+            elif protocol in (1, 58) and len(packet_bytes) >= transport_offset + 4:
+                icmp_hdr_len = 8 if len(packet_bytes) >= transport_offset + 8 else 4
+                payload_offset = transport_offset + icmp_hdr_len
             else:
                 return b""
 
@@ -823,14 +1043,72 @@ def calculate_payload_entropy(payload: bytes) -> float:
     return min(1.0, entropy / 8.0)
 
 
+_URL_HEX_RE = re.compile(rb"%([0-9a-fA-F]{2})")
+_HTML_HEX_ENTITY_RE = re.compile(rb"&#x0*([0-9a-fA-F]{1,2});?")
+_HTML_DEC_ENTITY_RE = re.compile(rb"&#0*(\d{1,3});?")
+_HEX_ESCAPE_BYTE_RE = re.compile(rb"\\x([0-9a-fA-F]{2})|\\u00([0-9a-fA-F]{2})")
+_EVAL_CALL_RE = re.compile(rb"(?<![a-z0-9_])eval\s*\(")
+_BENIGN_DOC_EXT_RE = re.compile(
+    rb"\b(?:powershell|cmd(?:\.exe)?)(?:[-_.][a-z0-9]+)*\.(?:pdf|md|txt|html|htm|rst|doc|docx|json|png|jpg|svg)\b"
+)
+
+
+def _normalize_inspected_payload(payload: bytes) -> bytes:
+    """Normalize NUL-interleaved (UTF-16/null-injection), URL-encoded, HTML-entity, and hex-escaped payloads."""
+    if not payload:
+        return b""
+    cleaned = payload.replace(b"\x00", b"")
+    for _ in range(2):
+        cleaned = _URL_HEX_RE.sub(lambda m: bytes([int(m.group(1), 16)]), cleaned)
+    cleaned = _HTML_HEX_ENTITY_RE.sub(lambda m: bytes([int(m.group(1), 16)]), cleaned)
+    cleaned = _HTML_DEC_ENTITY_RE.sub(
+        lambda m: bytes([min(255, int(m.group(1), 10))]), cleaned,
+    )
+    cleaned = _HEX_ESCAPE_BYTE_RE.sub(
+        lambda m: bytes([int(m.group(1) or m.group(2), 16)]), cleaned,
+    )
+    cleaned = cleaned.replace(b"&lt;", b"<").replace(b"&gt;", b">")
+    return cleaned
+
+
+def _marker_matches_in_context(lower_text: bytes, token: bytes) -> bool:
+    """Context-aware matching to prevent benign identifier/filename false positives."""
+    t = token.lower()
+    if t not in lower_text:
+        return False
+    if t == b"eval(":
+        return bool(_EVAL_CALL_RE.search(lower_text))
+    if t in (b"powershell", b"cmd.exe"):
+        stripped = _BENIGN_DOC_EXT_RE.sub(b"", lower_text)
+        return t in stripped
+    return True
+
+
+def _matches_enforcement_signature(payload: bytes) -> bytes | None:
+    """Check raw and normalized payloads against _ENFORCEMENT_SIGNATURES with token-boundary awareness."""
+    if not payload:
+        return None
+    candidates = (payload.lower(), _normalize_inspected_payload(payload).lower())
+    for sig in _ENFORCEMENT_SIGNATURES:
+        for text in candidates:
+            if _marker_matches_in_context(text, sig):
+                return sig
+    return None
+
+
 def _contains_multiencoding_bytes(payload: bytes, token: bytes) -> bool:
-    """ASCII トークンを UTF-8 / UTF-16LE / UTF-16BE バイナリ列で検索する。"""
-    if token in payload:
+    """ASCII トークンを UTF-8 / UTF-16LE / UTF-16BE / URL / HTMLエンティティ / NUL除去列で検索する。"""
+    lower_token = token.lower()
+    if _marker_matches_in_context(payload.lower(), lower_token):
+        return True
+    normalized_lower = _normalize_inspected_payload(payload).lower()
+    if _marker_matches_in_context(normalized_lower, lower_token):
         return True
     try:
-        utf16le = token.decode("ascii", errors="ignore").encode("utf-16le")
-        utf16be = token.decode("ascii", errors="ignore").encode("utf-16be")
-        if utf16le in payload or utf16be in payload:
+        utf16le = lower_token.decode("ascii", errors="ignore").encode("utf-16le")
+        utf16be = lower_token.decode("ascii", errors="ignore").encode("utf-16be")
+        lower_payload = payload.lower()
+        if utf16le in lower_payload or utf16be in lower_payload:
             return True
     except Exception as exc:
         log.warning(f"[PACKET] マルチエンコーディング検索に失敗しました ({exc})")
@@ -838,18 +1116,20 @@ def _contains_multiencoding_bytes(payload: bytes, token: bytes) -> bool:
 
 
 def _find_multiencoding_offset(payload: bytes, token: bytes) -> int:
-    if token in payload:
-        return payload.find(token)
+    lower_payload = payload.lower()
+    lower_token = token.lower()
+    if lower_token in lower_payload:
+        return lower_payload.find(lower_token)
     try:
-        utf16le = token.decode("ascii", errors="ignore").encode("utf-16le")
-        utf16be = token.decode("ascii", errors="ignore").encode("utf-16be")
-        if utf16le in payload:
-            return payload.find(utf16le)
-        if utf16be in payload:
-            return payload.find(utf16be)
+        utf16le = lower_token.decode("ascii", errors="ignore").encode("utf-16le")
+        utf16be = lower_token.decode("ascii", errors="ignore").encode("utf-16be")
+        if utf16le in lower_payload:
+            return lower_payload.find(utf16le)
+        if utf16be in lower_payload:
+            return lower_payload.find(utf16be)
     except Exception as exc:
         log.warning(f"[PACKET] マルチエンコーディングオフセット検索に失敗しました ({exc})")
-    return -1
+    return 0
 
 
 def _bytes_contains_any_multiencoding(payload: bytes, tokens: tuple[bytes, ...]) -> bool:
@@ -875,7 +1155,7 @@ def _classify_payload_text(payload_bytes: bytes) -> str:
 
 def _get_dynamic_calibration(interface: str | None = None, payload_len: int = 0, text_class: str | None = None, lower_payload: bytes | None = None, payload_bytes: bytes | None = None) -> dict:
     """通常時トラフィック密度に合わせて、DPIの判定閾値を動的に補正する。"""
-    iface_key = interface or "default"
+    iface_key = str(interface) if interface is not None else "default"
     history = _TRAFFIC_CALIBRATION_WINDOW.setdefault(iface_key, deque(maxlen=64))
     history.append(payload_len)
     traffic_pressure = min(1.0, len(history) / 64.0)
@@ -1025,7 +1305,21 @@ def _should_force_full_scan(packet_bytes: bytes, flow_state: dict) -> bool:
     if flags != last_flags and ((flags & 0x08) or (last_flags & 0x08) or (flags & 0x20) or (last_flags & 0x20)):
         return True
 
-    payload_len = len(extract_payload_bytes(packet_bytes))
+    payload_bytes = extract_payload_bytes(packet_bytes)
+    if payload_bytes:
+        lower_payload = payload_bytes.lower()
+        if (
+            b"\\x" in lower_payload
+            or b"\\u" in lower_payload
+            or b"%" in lower_payload
+            or b"&#" in lower_payload
+            or b"\x00" in payload_bytes
+            or _matches_enforcement_signature(payload_bytes) is not None
+            or _bytes_contains_any_multiencoding(payload_bytes, _CODE_EXECUTION_CONTEXT)
+        ):
+            return True
+
+    payload_len = len(payload_bytes)
     cumulative = flow_state.get("cumulative_bytes", 0) + payload_len
     packets = flow_state.get("packets_since_last_scan", 0) + 1
 
@@ -1627,7 +1921,15 @@ def analyze_dpi_payload(packet_bytes: bytes, payload: bytes | None = None, inter
         preview = payload_bytes[:min(payload_len, 4096)].decode("latin-1", errors="ignore")
         lower_payload = payload_bytes.lower()
 
-        if payload_len < 32 and not (b"\\x" in lower_payload or b"\\u" in lower_payload or _bytes_contains_any_multiencoding(payload_bytes, _CODE_EXECUTION_CONTEXT)):
+        if payload_len < 32 and not (
+            b"\\x" in lower_payload
+            or b"\\u" in lower_payload
+            or b"%" in lower_payload
+            or b"&#" in lower_payload
+            or b"\x00" in payload_bytes
+            or _matches_enforcement_signature(payload_bytes) is not None
+            or _bytes_contains_any_multiencoding(payload_bytes, _CODE_EXECUTION_CONTEXT)
+        ):
             return {
                 "payload_len": payload_len,
                 "entropy": calculate_payload_entropy(payload_bytes),
@@ -1824,8 +2126,11 @@ def analyze_dpi_payload(packet_bytes: bytes, payload: bytes | None = None, inter
 
         if not result["suspicious"] and not result["attack_signatures"]:
             _cache_flow_result(packet_bytes, result)
-        elif result["suspicious"]:
-            _cache_flow_result(packet_bytes, result)
+        else:
+            flow_key = _normalize_flow_key(packet_bytes)
+            if flow_key is not None:
+                with _FLOW_CACHE_LOCK:
+                    _FLOW_STATE_CACHE.pop(flow_key, None)
 
         return result
     except Exception as exc:
@@ -4940,7 +5245,7 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
             _last_pkt_time = now
             features = [
                 min(len(simulated_packet) / 1500.0, 1.0), min(_ema_delta, 1.0),
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, mem_mgr.get_usage_ratio(),
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, min(1.0, max(0.0, float(mem_mgr.get_usage_ratio()))),
             ]
             if not _packet_queue.full():
                 _packet_queue.put(PacketQueueItem(feature_vector=features, packet_bytes=simulated_packet))
@@ -5011,7 +5316,7 @@ def _packet_capture_worker(interface: str, mem_mgr: MemoryManager, dry_run: bool
                 is_ip, is_tcp, is_udp,      # プロトコル種別
                 float(syn), float(ack), float(fin),  # TCPフラグ
                 src_p,                      # 送信元ポート (正規化)
-                mem_mgr.get_usage_ratio()   # RAM使用率 → AIが自身の状態を知る
+                min(1.0, max(0.0, float(mem_mgr.get_usage_ratio())))  # RAM使用率 → AIが自身の状態を知る
             ]
 
             if not _packet_queue.full():
@@ -5480,16 +5785,27 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
             "reason": "frame_exceeds_policy_limit",
         }
 
-    if ONI_MODE:
+    if ONI_MODE or ONI_MODE_is_active():
         trace = build_diagnostic_trace(layer=1, threshold=0.01, score=1.0, reason="oni_mode")
         return {"block": True, "stage": "oni", "score": 1.0, "reason": "ONI_MODE enabled", "diagnostic_trace": trace}
 
     dpi_result = dpi_result or analyze_dpi_payload(packet_bytes, interface=interface)
-    payload = extract_payload_bytes(packet_bytes).lower()
-    matched_signature = next(
-        (signature for signature in _ENFORCEMENT_SIGNATURES if signature in payload),
-        None,
-    )
+    if dpi_result.get("scan_strategy") == "fail_closed":
+        trace = build_diagnostic_trace(layer=2, threshold=1.0, score=1.0, reason="dpi_fail_closed")
+        log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="dpi_fail_closed", reason="dpi_fail_closed")
+        return {
+            "block": True,
+            "stage": "dpi_fail_closed",
+            "score": 1.0,
+            "reason": "dpi_fail_closed",
+            "diagnostic_trace": trace,
+        }
+
+    extracted_payload = extract_payload_bytes(packet_bytes)
+    matched_signature = _matches_enforcement_signature(extracted_payload)
+    if matched_signature is None and not extracted_payload and packet_bytes:
+        if len(packet_bytes) >= 14 and _unwrap_l2_ether_type(packet_bytes)[0] not in (0x0800, 0x86DD, 0x0806):
+            matched_signature = _matches_enforcement_signature(packet_bytes)
     if matched_signature is not None:
         trace = build_diagnostic_trace(layer=2, threshold=1.0, score=1.0, reason="fixed_signature")
         log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="dpi", reason="payload_signature")
@@ -5498,19 +5814,38 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
             "reason": "fixed_payload_signature", "diagnostic_trace": trace,
         }
 
+    dpi_attack_sigs = set(dpi_result.get("attack_signatures") or ())
+    if (
+        dpi_result.get("suspicious")
+        and dpi_result.get("findings")
+        and dpi_attack_sigs.intersection({
+            "XSS", "Code eval", "PowerShell", "Command execution",
+            "Masked obfuscation", "Obfuscated payload", "Shellcode",
+        })
+    ):
+        trace = build_diagnostic_trace(layer=2, threshold=0.7, score=max(0.95, float(dpi_result.get("score", 1.0))), reason="dpi_attack_signature")
+        log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="dpi", reason="dpi_attack_signature")
+        return {
+            "block": True,
+            "stage": "signature",
+            "score": max(0.95, float(dpi_result.get("score", 1.0))),
+            "reason": "dpi_attack_signature",
+            "diagnostic_trace": trace,
+        }
+
     transport = parse_packet_transport(packet_bytes)
+    if transport and _is_ip_blacklisted(transport.get("src_ip")):
+        log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="blacklist", reason="source_ip_blacklisted")
+        return {"block": True, "stage": "blacklist", "score": 0.92, "reason": "source_blacklisted"}
     if transport and transport.get("parse_error"):
         src_ip = transport.get("src_ip")
         defense_decision = evaluate_progressive_defense(source_ip=src_ip, event_type="parse_error", occurrence_count=1)
         if defense_decision.get("defer"):
-            trace = build_diagnostic_trace(layer=4, threshold=0.8, score=0.4, reason="progressive_rate_limit")
+            trace = build_diagnostic_trace(layer=4, threshold=0.8, score=0.98, reason="progressive_rate_limit")
             log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="parse_error", reason="packet_parse_error")
-            return {"block": False, "stage": "rate_limited", "score": 0.0, "reason": "parse_error", "diagnostic_trace": trace}
+            return {"block": True, "stage": "rate_limited", "score": 0.98, "reason": "parse_error", "diagnostic_trace": trace}
         log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="parse_error", reason="packet_parse_error")
         return {"block": True, "stage": "parse_error", "score": 0.95, "reason": "parse_error"}
-    if transport and _is_ip_blacklisted(transport.get("src_ip")):
-        log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="blacklist", reason="source_ip_blacklisted")
-        return {"block": True, "stage": "blacklist", "score": 0.92, "reason": "source_blacklisted"}
 
     markers = analyze_packet_security_markers(packet_bytes, interface=interface)
 
@@ -5537,12 +5872,35 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
     ai_score = 0.0
     benign_probability = 0.0
     if feature_vector is not None:
-        ai_score = min(0.99, 0.2 + 0.15 * max(feature_vector[:3]) + 0.1 * sum(feature_vector[3:8]) + 0.1 * feature_vector[9])
+        if (
+            not isinstance(feature_vector, (list, tuple))
+            or len(feature_vector) != _ALLOWED_PACKET_FEATURE_LENGTH
+            or any(
+                isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(float(v))
+                or float(v) < 0.0
+                or float(v) > 1.0
+                for v in feature_vector
+            )
+        ):
+            _record_security_health_issue("malformed_packet", "invalid_feature_vector", source_ip=None)
+            trace = build_diagnostic_trace(layer=3, threshold=1.0, score=0.95, reason="invalid_feature_vector")
+            return {
+                "block": True,
+                "stage": "feature_validation",
+                "score": 0.95,
+                "reason": "invalid_feature_vector",
+                "diagnostic_trace": trace,
+            }
+        ai_score = min(0.99, max(0.0, 0.2 + 0.15 * max(feature_vector[:3]) + 0.1 * sum(feature_vector[3:8]) + 0.1 * feature_vector[9]))
         if model is not None and _HEAD_B_REVIEWED:
             try:
                 with _MODEL_ACCESS_LOCK, torch.no_grad():
                     _, score_b, _ = model(torch.tensor([feature_vector], dtype=torch.float32))
                 benign_probability = float(score_b.reshape(-1)[0].item())
+                if not math.isfinite(benign_probability):
+                    benign_probability = 0.0
                 ai_score = _adjust_soft_ai_score(ai_score, benign_probability, reviewed=True)
             except Exception:
                 benign_probability = 0.0
@@ -5551,12 +5909,14 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
             with torch.no_grad():
                 score_a, _, _ = model(torch.tensor([[0.0] * 10], dtype=torch.float32))
             ai_score = float(score_a.item()) if hasattr(score_a, "item") else 0.0
+            if not math.isfinite(ai_score):
+                ai_score = 0.0
         except Exception:
             ai_score = 0.0
 
     math_score = 0.0
     if feature_vector is not None:
-        math_score = min(0.99, sum(float(v) for v in feature_vector[:5]) / 5.0)
+        math_score = min(0.99, max(0.0, sum(float(v) for v in feature_vector[:5]) / 5.0))
     elif transport:
         math_score = min(0.99, (0.35 if transport.get("protocol") == socket.IPPROTO_TCP else 0.1))
 
@@ -5754,7 +6114,7 @@ def _gdrive_update_worker(model: LightweightMultiTaskAI, optimizer,
             time.sleep(interval_sec)
         first_run = False
 
-        if ONI_MODE:
+        if ONI_MODE or ONI_MODE_is_active():
             log.warning("[ローカル更新] ONI_MODE 中のため、外部データ更新を一時停止します。")
             continue
 

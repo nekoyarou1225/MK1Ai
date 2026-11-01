@@ -21,6 +21,13 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import mk1_memory_guard
+from mk1_key_registry import (
+    KeyRegistryError,
+    RevocationManifest,
+    derive_device_purpose_key,
+    verify_revocation_manifest,
+)
+from mk1_session_ratchet import SessionRatchet, SessionRatchetError
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -36,6 +43,8 @@ _TRANSPORT_STATE_LOCK = threading.RLock()
 _TRANSPORT_ENABLED = True
 _TRANSPORT_GENERATION = 0
 _ACTIVE_ENVELOPES: set["EncryptedRequest"] = set()
+_ACTIVE_RATCHETS: set[SessionRatchet] = set()
+_ACTIVE_REVOCATION_MANIFEST: RevocationManifest | None = None
 
 
 class TunnelControlServer:
@@ -226,6 +235,9 @@ def set_memory_guard_enabled(enabled: bool) -> None:
         except OSError:
             for envelope in envelopes:
                 mk1_memory_guard.unlock_buffer(envelope.key)
+            for ratchet in tuple(_ACTIVE_RATCHETS):
+                ratchet.destroy()
+            _ACTIVE_RATCHETS.clear()
             mk1_memory_guard.set_enabled(False)
             raise
 
@@ -273,6 +285,50 @@ def set_transport_enabled(enabled: bool) -> None:
         _TRANSPORT_ENABLED = False
         for envelope in tuple(_ACTIVE_ENVELOPES):
             envelope.destroy()
+        for ratchet in tuple(_ACTIVE_RATCHETS):
+            ratchet.destroy()
+        _ACTIVE_RATCHETS.clear()
+
+
+def set_revocation_manifest(manifest: RevocationManifest | None) -> None:
+    """Install or clear the active device revocation manifest under lock."""
+    global _ACTIVE_REVOCATION_MANIFEST
+    if manifest is not None and not isinstance(manifest, RevocationManifest):
+        raise TypeError("Expected a verified RevocationManifest instance or None")
+    with _TRANSPORT_STATE_LOCK:
+        if (
+            manifest is not None
+            and _ACTIVE_REVOCATION_MANIFEST is not None
+            and manifest.generation < _ACTIVE_REVOCATION_MANIFEST.generation
+        ):
+            raise SecureTransportError("Revocation manifest rollback rejected")
+        _ACTIVE_REVOCATION_MANIFEST = manifest
+
+
+def require_device_not_revoked(device_id: str | None) -> None:
+    """Fail closed when the active revocation manifest lists device_id."""
+    if device_id is None:
+        return
+    with _TRANSPORT_STATE_LOCK:
+        manifest = _ACTIVE_REVOCATION_MANIFEST
+        if manifest is not None and manifest.is_revoked(device_id):
+            raise SecureTransportError("Device identity has been revoked")
+
+
+def create_ratcheted_session(
+    shared_secret: bytearray,
+    *,
+    context: bytes,
+    role: str,
+    device_id: str | None = None,
+) -> SessionRatchet:
+    """Create a forward-secure SessionRatchet bound to the transport gate."""
+    with _TRANSPORT_STATE_LOCK:
+        _require_transport_enabled()
+        require_device_not_revoked(device_id)
+        ratchet = SessionRatchet(shared_secret, context=context, role=role)
+        _ACTIVE_RATCHETS.add(ratchet)
+        return ratchet
 
 
 def request_transport_state(path: str, enabled: bool) -> bool:

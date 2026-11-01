@@ -52,8 +52,19 @@ PY
 (cd "$ROOT_DIR" && MK1AI_RELEASE_WORK="$WORK_DIR" python3 "$WORK_DIR/setup.py" build_ext \
     --build-lib "$STAGE/runtime" --build-temp "$WORK_DIR/objects")
 
-for source in mk1_map.py mk1_memory_guard.py mk1_secure_transport.py; do
-    cp -- "$ROOT_DIR/$source" "$STAGE/runtime/$source"
+for source in \
+    mk1_map.py \
+    mk1_memory_guard.py \
+    mk1_secure_transport.py \
+    mk1_firewall.py \
+    mk1_key_registry.py \
+    mk1_session_ratchet.py \
+    mk1_honeypot.py \
+    mk1_license.py \
+    mk1_one_tap_crypto.py; do
+    if [[ -f "$ROOT_DIR/$source" ]]; then
+        cp -- "$ROOT_DIR/$source" "$STAGE/runtime/$source"
+    fi
 done
 
 make -C "$ROOT_DIR" panel BUILD_DIR="$WORK_DIR/native-build"

@@ -10,12 +10,20 @@ import stat
 from pathlib import Path
 from typing import Mapping
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
+    _CRYPTOGRAPHY_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - minimal environment fallback
+    InvalidSignature = Exception  # type: ignore[assignment,misc]
+    serialization = None  # type: ignore[assignment]
+    Ed25519PrivateKey = object  # type: ignore[assignment,misc]
+    Ed25519PublicKey = object  # type: ignore[assignment,misc]
+    _CRYPTOGRAPHY_AVAILABLE = False
 
 
 MAX_APPROVAL_BUNDLE_BYTES = 32 * 1024
@@ -140,6 +148,8 @@ def create_approval_record(
     private_key_pem: bytes,
 ) -> bytes:
     """Sign only a well-formed, fresh release challenge using an Ed25519 key."""
+    if not _CRYPTOGRAPHY_AVAILABLE or serialization is None:
+        raise QuorumError("cryptography library is required for Ed25519 quorum operations")
     signer_id = _validate_signer_id(signer_id)
     _, message = _parse_challenge(challenge_document)
     try:
@@ -224,6 +234,8 @@ def _read_trusted_key(
     expected_uid: int,
     strict_ancestors: bool,
 ) -> Ed25519PublicKey:
+    if not _CRYPTOGRAPHY_AVAILABLE or serialization is None:
+        raise QuorumError("cryptography library is required for Ed25519 quorum operations")
     try:
         file_descriptor = os.open(
             path,
@@ -306,6 +318,8 @@ def verify_approval_bundle(
     threshold: int = 2,
 ) -> tuple[str, ...]:
     """Require distinct, known signer IDs and valid signatures over one message."""
+    if not _CRYPTOGRAPHY_AVAILABLE or serialization is None:
+        raise QuorumError("cryptography library is required for Ed25519 quorum operations")
     if not isinstance(message, bytes) or not message:
         raise QuorumError("Quorum message must be non-empty bytes")
     if not isinstance(bundle, bytes) or len(bundle) > MAX_APPROVAL_BUNDLE_BYTES:

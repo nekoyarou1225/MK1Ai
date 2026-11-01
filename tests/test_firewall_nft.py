@@ -31,6 +31,16 @@ class NftRenderTest(unittest.TestCase):
             "delete table inet mk1ai_quarantine",
         ])
 
+    def test_render_includes_loopback_and_ct_state_invalid_drop(self):
+        text = mk1_firewall.render_nft_transaction(mode="full_isolation")
+        self.assertIn('iifname "lo" accept', text)
+        self.assertIn('oifname "lo" accept', text)
+        self.assertEqual(text.count("ct state invalid drop"), 3)
+        self.assertLess(
+            text.index('add rule inet mk1ai_quarantine input iifname "lo" accept'),
+            text.index("add rule inet mk1ai_quarantine input ct state invalid drop"),
+        )
+
 
 class NftSupportTest(unittest.TestCase):
     def _run(self, stdout, code=0):
@@ -54,6 +64,11 @@ class NftSupportTest(unittest.TestCase):
             self.assertFalse(mk1_firewall.remove_nft_policy())
             run.assert_not_called()
         self.assertEqual(mk1_firewall.last_nft_failure, "old")
+
+    def test_remove_records_failure_reason_when_not_root(self):
+        with mock.patch("os.geteuid", return_value=1000):
+            self.assertFalse(mk1_firewall.remove_nft_policy())
+        self.assertEqual(mk1_firewall.last_nft_failure, "nftables の解除にはroot権限が必要です")
 
 
 if __name__ == "__main__":

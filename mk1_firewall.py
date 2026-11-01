@@ -140,7 +140,7 @@ def apply_nft_policy(
 def remove_nft_policy(nft_binary: str | None = None) -> bool:
     """Remove only the quarantine table in one batch; mk1ai_egress is untouched."""
     if hasattr(os, "geteuid") and os.geteuid() != 0:
-        return False
+        return _fail("nftables の解除にはroot権限が必要です")
     try:
         path = _trusted_nft_binary(nft_binary)
     except OSError as exc:
@@ -207,6 +207,11 @@ def render_nft_transaction(
             "add chain inet mk1ai_quarantine forward "
             "{ type filter hook forward priority -10; policy drop; }"
         ),
+        'add rule inet mk1ai_quarantine input iifname "lo" accept',
+        'add rule inet mk1ai_quarantine output oifname "lo" accept',
+        "add rule inet mk1ai_quarantine input ct state invalid drop",
+        "add rule inet mk1ai_quarantine output ct state invalid drop",
+        "add rule inet mk1ai_quarantine forward ct state invalid drop",
     ]
     if mode == "management_safe_harbor":
         for address in addresses:

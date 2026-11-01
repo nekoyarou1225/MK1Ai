@@ -2852,6 +2852,198 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
         flow_state["cumulative_bytes"] = 10240
         self.assertTrue(module._should_force_full_scan(packet, flow_state))
 
+    def test_dpi_fail_closed_propagates_to_inspect_packet_pipeline(self):
+        packet = self._build_ipv4_tcp_packet("198.51.100.10", "198.51.100.20", 80) + b"GET / HTTP/1.1\r\n\r\n"
+        fail_closed_dpi = module._build_fail_closed_dpi_result(packet, "simulated_dpi_error")
+        result = module.inspect_packet_pipeline(
+            packet, "eth0", feature_vector=[0.1] * 10, dpi_result=fail_closed_dpi
+        )
+        self.assertTrue(result["block"])
+        self.assertEqual(result["stage"], "dpi_fail_closed")
+        self.assertEqual(result["score"], 1.0)
+
+    def test_multiencoding_and_obfuscated_signatures_blocked_while_benign_contexts_pass(self):
+        base_pkt = self._build_ipv4_tcp_packet("198.51.100.11", "198.51.100.21", 80)
+        attack_payloads = [
+            "powershell -NoProfile -Command IEX".encode("utf-16le"),
+            "powershell -NoProfile".encode("utf-16be"),
+            b"GET /?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E HTTP/1.1\r\n\r\n",
+            b"<scr\x00ipt>alert(1)</scr\x00ipt>",
+            b"<a href=\"&#x6a;avascript:alert(1)\">x</a>",
+        ]
+        for payload in attack_payloads:
+            res = module.inspect_packet_pipeline(base_pkt + payload, "eth0", feature_vector=[0.1] * 10)
+            self.assertTrue(res["block"], f"Expected block for payload={payload!r}")
+            self.assertEqual(res["stage"], "signature")
+
+        benign_payloads = [
+            b"def my_eval(x): return x + 1\n",
+            b"GET /docs/powershell-guide.pdf HTTP/1.1\r\nHost: docs.local\r\n\r\n",
+            b"GET /manual/cmd.exe.txt HTTP/1.1\r\nHost: docs.local\r\n\r\n",
+        ]
+        for payload in benign_payloads:
+            res = module.inspect_packet_pipeline(base_pkt + payload, "eth0", feature_vector=[0.1] * 10)
+            self.assertFalse(res["block"], f"Unexpected false positive for payload={payload!r}")
+
+    def test_malformed_headers_fail_closed_and_progressive_defense_never_unblocks(self):
+        trunc_l2 = b"\x00" * 10
+        trunc_ipv4 = b"\x00" * 12 + struct.pack("!H", 0x0800) + b"\x45\x00\x00\x14"
+        bad_ihl = (
+            b"\x00" * 12
+            + struct.pack("!H", 0x0800)
+            + struct.pack(
+                "!BBHHHBBH4s4s",
+                (4 << 4) | 2,
+                0,
+                40,
+                0,
+                0,
+                64,
+                6,
+                0,
+                socket.inet_aton("192.0.2.55"),
+                socket.inet_aton("192.0.2.56"),
+            )
+            + b"\x00" * 20
+        )
+        for pkt in (trunc_l2, trunc_ipv4, bad_ihl):
+            parsed = module.parse_packet_transport(pkt)
+            self.assertTrue(parsed.get("parse_error"))
+            self.assertEqual(parsed.get("parse_status"), "MALFORMED")
+            res = module.inspect_packet_pipeline(pkt, "eth0", feature_vector=[0.1] * 10)
+            self.assertTrue(res["block"])
+
+        module._SOURCE_ERROR_STATE.clear()
+        module._BLACKLISTED_SOURCES.clear()
+        trunc_tcp = (
+            b"\x00" * 12
+            + struct.pack("!H", 0x0800)
+            + struct.pack(
+                "!BBHHHBBH4s4s",
+                0x45,
+                0,
+                28,
+                0,
+                0,
+                64,
+                6,
+                0,
+                socket.inet_aton("192.0.2.99"),
+                socket.inet_aton("192.0.2.100"),
+            )
+            + b"\x00" * 8
+        )
+        stages = []
+        for _ in range(5):
+            decision = module.inspect_packet_pipeline(trunc_tcp, "eth0", feature_vector=[0.1] * 10)
+            self.assertTrue(decision["block"])
+            stages.append(decision["stage"])
+        self.assertEqual(stages[:3], ["parse_error", "parse_error", "rate_limited"])
+        self.assertEqual(stages[3:], ["blacklist", "blacklist"])
+
+    def test_toggle_oni_mode_synchronizes_global_and_blocks_pipeline(self):
+        pkt = self._build_ipv4_tcp_packet("198.51.100.30", "198.51.100.31", 80) + b"GET / HTTP/1.1\r\n\r\n"
+        try:
+            module.toggle_oni_mode(False)
+            self.assertFalse(module.ONI_MODE)
+            self.assertFalse(module.ONI_MODE_is_active())
+            module.toggle_oni_mode()
+            self.assertTrue(module.ONI_MODE)
+            self.assertTrue(module.ONI_MODE_is_active())
+            res = module.inspect_packet_pipeline(pkt, "eth0", feature_vector=[0.1] * 10)
+            self.assertTrue(res["block"])
+            self.assertEqual(res["stage"], "oni")
+        finally:
+            module.toggle_oni_mode(False)
+
+    def test_vlan_icmp_and_ipv6_ext_header_payload_extraction_and_blocking(self):
+        base_pkt = self._build_ipv4_tcp_packet("198.51.100.40", "198.51.100.41", 80)
+        vlan_pkt = (
+            b"\x00" * 12
+            + struct.pack("!HH", 0x8100, 100)
+            + struct.pack("!H", 0x0800)
+            + base_pkt[14:]
+            + b"<script>alert(1)</script>"
+        )
+        self.assertEqual(module.extract_payload_bytes(vlan_pkt), b"<script>alert(1)</script>")
+        self.assertTrue(module.inspect_packet_pipeline(vlan_pkt, "eth0", feature_vector=[0.1] * 10)["block"])
+
+        icmp_pkt = (
+            b"\x00" * 12
+            + struct.pack("!H", 0x0800)
+            + struct.pack(
+                "!BBHHHBBH4s4s",
+                0x45,
+                0,
+                28 + 25,
+                0,
+                0,
+                64,
+                1,
+                0,
+                socket.inet_aton("198.51.100.42"),
+                socket.inet_aton("198.51.100.43"),
+            )
+            + struct.pack("!BBHHH", 8, 0, 0, 1, 1)
+            + b"<script>alert(1)</script>"
+        )
+        self.assertEqual(module.extract_payload_bytes(icmp_pkt), b"<script>alert(1)</script>")
+        self.assertTrue(module.inspect_packet_pipeline(icmp_pkt, "eth0", feature_vector=[0.1] * 10)["block"])
+
+        # IPv6 with Fragment Extension Header (next_hdr=44 -> TCP=6)
+        eth6 = struct.pack("!6s6sH", b"\x00" * 6, b"\x00" * 6, 0x86DD)
+        src6 = socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+        dst6 = socket.inet_pton(socket.AF_INET6, "2001:db8::2")
+        ipv6_hdr = struct.pack("!IHBB16s16s", 0x60000000, 8 + 20 + 25, 44, 64, src6, dst6)
+        frag_ext = struct.pack("!BBHI", 6, 0, 0, 12345)
+        tcp_hdr = struct.pack("!HHIIBBHHH", 12345, 80, 1, 1, (5 << 4), 0x18, 1024, 0, 0)
+        ipv6_ext_pkt = eth6 + ipv6_hdr + frag_ext + tcp_hdr + b"<script>alert(1)</script>"
+        self.assertEqual(module.extract_payload_bytes(ipv6_ext_pkt), b"<script>alert(1)</script>")
+        self.assertTrue(module.inspect_packet_pipeline(ipv6_ext_pkt, "eth0", feature_vector=[0.1] * 10)["block"])
+
+    def test_invalid_feature_vector_fails_closed(self):
+        pkt = self._build_ipv4_tcp_packet("198.51.100.50", "198.51.100.51", 80) + b"GET / HTTP/1.1\r\n\r\n"
+        invalid_vectors = [
+            [0.5] * 3,
+            [-100.0] * 10,
+            [1.5] * 10,
+            [float("nan")] * 10,
+            [float("inf")] * 10,
+            [float("-inf")] * 10,
+            [True] * 10,
+        ]
+        for fv in invalid_vectors:
+            res = module.inspect_packet_pipeline(pkt, "eth0", feature_vector=fv)
+            self.assertTrue(res["block"])
+            self.assertEqual(res["stage"], "feature_validation")
+
+    def test_ipv6_esp_header_validated_without_extension_walk_misparse(self):
+        eth6 = struct.pack("!6s6sH", b"\x00" * 6, b"\x00" * 6, 0x86DD)
+        src6 = socket.inet_pton(socket.AF_INET6, "2001:db8::10")
+        dst6 = socket.inet_pton(socket.AF_INET6, "2001:db8::20")
+        # Valid ESP packet (next_hdr=50, SPI=0xdeadbeef, Seq=1, encrypted body)
+        esp_payload = struct.pack("!II", 0xDEADBEEF, 1) + b"\xaa" * 16
+        ipv6_esp_pkt = eth6 + struct.pack("!IHBB16s16s", 0x60000000, len(esp_payload), 50, 64, src6, dst6) + esp_payload
+        parsed = module.parse_packet_transport(ipv6_esp_pkt)
+        self.assertEqual(parsed.get("parse_status"), "VALID")
+        self.assertEqual(parsed.get("protocol"), 50)
+        self.assertEqual(module.extract_payload_bytes(ipv6_esp_pkt), b"")
+
+        # Truncated ESP packet (< 8 bytes after IPv6 header) fails closed
+        trunc_esp = eth6 + struct.pack("!IHBB16s16s", 0x60000000, 4, 50, 64, src6, dst6) + b"\xde\xad\xbe\xef"
+        parsed_trunc = module.parse_packet_transport(trunc_esp)
+        self.assertTrue(parsed_trunc.get("parse_error"))
+        self.assertEqual(parsed_trunc.get("reason"), "truncated_esp_header")
+
+    def test_memory_pressure_ratio_clamped_for_feature_vector(self):
+        pkt = self._build_ipv4_tcp_packet("198.51.100.60", "198.51.100.61", 80) + b"GET / HTTP/1.1\r\n\r\n"
+        clamped_ratio = min(1.0, max(0.0, float(1.42)))
+        fv = [0.2] * 9 + [clamped_ratio]
+        res = module.inspect_packet_pipeline(pkt, "eth0", feature_vector=fv)
+        self.assertNotEqual(res["stage"], "feature_validation")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
