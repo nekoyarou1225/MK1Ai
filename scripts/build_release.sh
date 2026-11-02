@@ -61,9 +61,27 @@ for source in \
     mk1_session_ratchet.py \
     mk1_honeypot.py \
     mk1_license.py \
-    mk1_one_tap_crypto.py; do
+    mk1_one_tap_crypto.py \
+    mk1_hybrid_kem.py \
+    mk1_quorum.py \
+    mk1_vault_envelope.py \
+    mk1_deception.py \
+    mk1_isolation.py \
+    mk1_Immutable_os.py \
+    mk1_immutable_os.py \
+    mk1_update_verifier.py \
+    mk1_audit_log.py \
+    mk1_admin_portal.py \
+    mk1_sovereign_enclave.py \
+    mk1_xdp_controller.py; do
     if [[ -f "$ROOT_DIR/$source" ]]; then
         cp -- "$ROOT_DIR/$source" "$STAGE/runtime/$source"
+    fi
+done
+for pkg_dir in mk1_qkd security/ebpf cryptography pqcrypto argon2 shamir_mnemonic; do
+    if [[ -d "$ROOT_DIR/$pkg_dir" ]]; then
+        mkdir -p "$STAGE/runtime/$(dirname "$pkg_dir")"
+        cp -R -- "$ROOT_DIR/$pkg_dir" "$STAGE/runtime/$pkg_dir"
     fi
 done
 

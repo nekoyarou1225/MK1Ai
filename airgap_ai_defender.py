@@ -658,6 +658,9 @@ def _skip_ipv6_extension_headers(
         if current_proto == 44:  # Fragment header (fixed 8 bytes)
             if len(packet_bytes) < current_offset + 8:
                 return current_proto, current_offset, True
+            frag_field = struct.unpack("!H", packet_bytes[current_offset + 2:current_offset + 4])[0]
+            if (frag_field & 0xFFF8) != 0:
+                return current_proto, current_offset, True
             current_proto = packet_bytes[current_offset]
             current_offset += 8
         elif current_proto == 51:  # Authentication Header (AH): (hdr_len + 2) * 4
@@ -790,7 +793,18 @@ def parse_packet_transport(packet_bytes: bytes) -> dict:
                     "dst_ip": dst_ip,
                 }
 
+            frag_field = struct.unpack("!H", packet_bytes[ip_offset + 6:ip_offset + 8])[0]
             protocol = packet_bytes[ip_offset + 9]
+            if (frag_field & 0x1FFF) != 0:
+                return {
+                    "parse_error": True,
+                    "parse_status": "MALFORMED",
+                    "reason": "non_initial_ipv4_fragment",
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "protocol": protocol,
+                }
+
             src_port = dst_port = None
             transport_offset = ip_offset + ihl
             if protocol == socket.IPPROTO_TCP:
@@ -942,6 +956,16 @@ def parse_packet_transport(packet_bytes: bytes) -> dict:
                 "parse_status": "VALID",
             }
         else:
+            if ether_type in (0x8847, 0x8848, 0x8863, 0x8864, 0x88E5, 0x88F7) or (
+                packet_bytes[:6] == b"\x00" * 6 and ether_type not in (0x0800, 0x86DD, 0x0806)
+            ):
+                return {
+                    "parse_error": True,
+                    "parse_status": "MALFORMED",
+                    "reason": "unsupported_l2_ethertype",
+                    "ether_type": ether_type,
+                    "src_ip": None,
+                }
             return {}
     except Exception as exc:
         _record_security_health_issue("parse_exception", "parse_packet_transport", source_ip=_extract_src_ip(packet_bytes))
@@ -1195,6 +1219,13 @@ def _record_security_health_issue(issue_type: str, context: str = "", source_ip:
         if len(ips) >= _SOURCE_ERROR_THRESHOLD and ts - ips[0] <= _SOURCE_ERROR_WINDOW_SEC:
             with _HEALTH_LOCK:
                 _BLACKLISTED_SOURCES[source_ip] = ts + _SOURCE_IP_BLOCK_SEC
+            try:
+                import mk1_xdp_controller
+                mk1_xdp_controller.DEFAULT_XDP_CONTROLLER.add_blocklist_entry(
+                    source_ip, ttl_sec=int(_SOURCE_IP_BLOCK_SEC), reason=issue_type,
+                )
+            except Exception:
+                pass
             log.warning(f"[IP_BLACKLIST] 疑わしい送信元 IP を一時遮断しました: {source_ip}")
             return
 
@@ -1337,6 +1368,11 @@ def _should_force_full_scan(packet_bytes: bytes, flow_state: dict) -> bool:
         threshold = max(32, last_payload_len // 2)
         if delta >= threshold:
             return True
+
+    last_digest = flow_state.get("last_payload_digest")
+    if payload_len > 0 and last_digest is not None:
+        if hashlib.sha256(payload_bytes).digest() != last_digest:
+            return True
     return False
 
 
@@ -1396,7 +1432,8 @@ def _cache_flow_result(packet_bytes: bytes, result: dict) -> None:
         return
 
     packet_flags = _tcp_flag_bits(packet_bytes)
-    payload_len = len(extract_payload_bytes(packet_bytes))
+    payload_bytes_raw = extract_payload_bytes(packet_bytes)
+    payload_len = len(payload_bytes_raw)
     transport = parse_packet_transport(packet_bytes)
     endpoints = tuple(sorted(
         [
@@ -1410,6 +1447,7 @@ def _cache_flow_result(packet_bytes: bytes, result: dict) -> None:
     flow_state = {
         "sample_counter": 0,
         "last_payload_len": payload_len,
+        "last_payload_digest": hashlib.sha256(payload_bytes_raw).digest() if payload_bytes_raw else b"",
         "last_result": dict(result),
         "last_seen": time.time(),
         "last_scan_time": time.time(),
@@ -3997,9 +4035,16 @@ def _probe_network_connectivity() -> bool | None:
         return None
 
 
-def execute_generated_payload(payload: dict, dry_run: bool = False, available_interfaces=None, interface: str | None = None) -> bool:
-    """Preview a generated policy; active execution waits for per-event approval."""
-    if not dry_run:
+def execute_generated_payload(
+    payload: dict,
+    dry_run: bool = False,
+    available_interfaces=None,
+    interface: str | None = None,
+    *,
+    approval_verified: bool = False,
+) -> bool:
+    """Preview a generated policy; active execution requires verified per-event approval."""
+    if not dry_run and not approval_verified:
         log.error(
             "[DYNAMIC_EXECUTION] イベントごとの管理者承認機能が未実装のため、"
             "実遮断ペイロードを拒否しました。"
@@ -4010,12 +4055,29 @@ def execute_generated_payload(payload: dict, dry_run: bool = False, available_in
 
     commands = payload.get("commands", [])
     nft_policy = payload.get("nft_policy")
-    log.info("[DYNAMIC_EXECUTION] Dry-Runのため隔離ポリシーは適用しません。")
+    if dry_run:
+        log.info("[DYNAMIC_EXECUTION] Dry-Runのため隔離ポリシーは適用しません。")
+        if nft_policy:
+            log.critical("[NFT] Dry-Run: 単一トランザクションによる隔離ポリシー適用予定")
+        for cmd in commands:
+            log.critical(f"    - 予定: {' '.join(cmd)}")
+        return True
+
+    applied_any = False
     if nft_policy:
-        log.critical("[NFT] Dry-Run: 単一トランザクションによる隔離ポリシー適用予定")
+        if _apply_nft_policy_with_sudo(nft_policy):
+            applied_any = True
     for cmd in commands:
-        log.critical(f"    - 予定: {' '.join(cmd)}")
-    return True
+        if _run_command_with_sudo(list(cmd)):
+            applied_any = True
+    if applied_any:
+        _persist_quarantine_state(
+            interface,
+            available_interfaces or [],
+            containment_plan={"commands_count": len(commands), "nft_applied": bool(nft_policy)},
+            dry_run=False,
+        )
+    return applied_any
 
 
 def discover_available_interfaces() -> list:
@@ -5532,9 +5594,43 @@ def _apply_anomaly_decay(now: float | None = None) -> tuple[float, bool]:
     return _ANOMALY_DECAY_LAST_TIME, False
 
 
+def verify_event_isolation_approval(
+    approval_bundle: dict | None,
+    *,
+    challenge_document: dict | None,
+    trusted_keys: dict[str, bytes] | None,
+    interface: str | None = None,
+    now: int | None = None,
+) -> bool:
+    """Verify per-event M-of-N Ed25519 quorum approval before active network isolation."""
+    if not approval_bundle or not challenge_document or not trusted_keys:
+        return False
+    try:
+        import mk1_quorum
+        current_ts = int(time.time()) if now is None else int(now)
+        result = mk1_quorum.verify_quorum_bundle(
+            approval_bundle,
+            challenge_document=challenge_document,
+            trusted_keys=trusted_keys,
+            expected_operation="ISOLATE_NETWORK",
+            now=current_ts,
+        )
+        if interface is not None:
+            params = challenge_document.get("parameters", {})
+            if isinstance(params, dict) and params.get("interface") not in (None, interface):
+                return False
+        return bool(result.get("verified"))
+    except Exception as exc:
+        log.error(f"[ISOLATION_APPROVAL] クォーラム承認検証に失敗しました ({exc})")
+        return False
+
+
 def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float = 0.0,
-                          backdoor_detected: bool = False, backdoor_boost: float = 0.0) -> bool:
-    """Threats are advisory; active isolation waits for per-event operator approval."""
+                          backdoor_detected: bool = False, backdoor_boost: float = 0.0,
+                          *, approval_bundle: dict | None = None,
+                          challenge_document: dict | None = None,
+                          trusted_keys: dict[str, bytes] | None = None) -> bool:
+    """Threats are advisory; active isolation requires verified per-event operator approval."""
     global _ISOLATION_APPROVAL_PENDING, _LAST_KILL_SWITCH_TRIGGER
     global _anomaly_counter, _LAST_THREAT_SCORE
     _LAST_THREAT_SCORE = max(0.0, min(0.99, float(score_a)))
@@ -5582,6 +5678,22 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                     "kill_switch", interface=interface, dry_run=True, **management_route,
                 ):
                     execute_kill_switch(interface, True, **management_route)
+            elif verify_event_isolation_approval(
+                approval_bundle,
+                challenge_document=challenge_document,
+                trusted_keys=trusted_keys,
+                interface=interface,
+            ):
+                _ISOLATION_APPROVAL_PENDING = False
+                management_route = _configured_management_route()
+                execute_kill_switch(
+                    interface,
+                    False,
+                    approval_bundle=approval_bundle,
+                    challenge_document=challenge_document,
+                    trusted_keys=trusted_keys,
+                    **management_route,
+                )
             else:
                 _ISOLATION_APPROVAL_PENDING = True
                 log.error(
@@ -5775,8 +5887,9 @@ def _adjust_soft_ai_score(ai_score: float, benign_probability: float, reviewed: 
 
 
 def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=None, dry_run: bool = False,
-                            feature_vector=None, dpi_result: dict | None = None) -> dict:
-    """Enforce only fixed input rules; AI and anomaly scores are advisory."""
+                            feature_vector=None, dpi_result: dict | None = None,
+                            *, enforce_ai_anomaly: bool = False) -> dict:
+    """Enforce fixed input rules; AI and anomaly scores are advisory unless enforce_ai_anomaly=True."""
     global _BACKDOOR_RISK_SCORE
 
     if len(packet_bytes) > _MAX_ENFORCED_FRAME_BYTES:
@@ -5925,11 +6038,30 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
     composite_score = _compute_composite_anomaly_score(
         rule_score, ai_score, math_score, unknown_score, behavior_score,
     )
+    overall_score = max(rule_score, ai_score, math_score, unknown_score, behavior_score, composite_score)
+
+    if enforce_ai_anomaly and max(ai_score, composite_score) >= _NORMAL_MODE_AI_THRESHOLD:
+        trace = build_diagnostic_trace(
+            layer=3, threshold=_NORMAL_MODE_AI_THRESHOLD, score=overall_score, reason="ai_anomaly_threshold_exceeded",
+        )
+        return {
+            "block": True,
+            "stage": "ai_anomaly",
+            "score": overall_score,
+            "reason": "ai_anomaly_threshold_exceeded",
+            "diagnostic_trace": trace,
+            "advisory": {
+                "ai_score": ai_score,
+                "math_score": math_score,
+                "unknown_score": unknown_score,
+                "behavior_score": behavior_score,
+            },
+        }
 
     return {
         "block": False,
         "stage": "advisory",
-        "score": max(rule_score, ai_score, math_score, unknown_score, behavior_score, composite_score),
+        "score": overall_score,
         "reason": "advisory_scores_only",
         "advisory": {
             "ai_score": ai_score,
@@ -5989,23 +6121,38 @@ def _publish_threat_map_event(packet_bytes: bytes, reason: str, threat_score: fl
         service.publish(event)
 
 
-def execute_kill_switch(interface: str | None, dry_run: bool, available_interfaces=None, containment_mode: str = "full_isolation", management_ports=None, management_ips=None):
+def execute_kill_switch(
+    interface: str | None,
+    dry_run: bool,
+    available_interfaces=None,
+    containment_mode: str = "full_isolation",
+    management_ports=None,
+    management_ips=None,
+    *,
+    approval_bundle: dict | None = None,
+    challenge_document: dict | None = None,
+    trusted_keys: dict[str, bytes] | None = None,
+):
     """
-    Render a dry-run containment plan; active enforcement is disabled pending
-    a per-event operator-approval workflow.
+    Render a dry-run containment plan, or execute active containment when a
+    verified per-event M-of-N Ed25519 operator approval bundle is supplied.
     """
+    approval_verified = False
     if not dry_run:
-        log.error(
-            "[AIRGAP] イベントごとの管理者承認が未実装のため、実遮断を拒否しました。"
+        approval_verified = verify_event_isolation_approval(
+            approval_bundle,
+            challenge_document=challenge_document,
+            trusted_keys=trusted_keys,
+            interface=interface,
         )
-        return False
+        if not approval_verified:
+            log.error(
+                "[AIRGAP] イベントごとの管理者承認が未実装のため、実遮断を拒否しました。"
+            )
+            return False
 
     if available_interfaces is None:
         available_interfaces = discover_available_interfaces()
-
-    if containment_mode == "full_isolation" and (management_ports or management_ips):
-        containment_mode = "management_safe_harbor"
-        log.warning("[ACTIVE_DEFENSE / AIRGAP_CONTAINMENT] management_safe_harbor に自動昇格(記載された管理経路あり)")
 
     if containment_mode == "full_isolation" and (management_ports or management_ips):
         containment_mode = "management_safe_harbor"
@@ -6030,7 +6177,13 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
         log.critical("    → Dry-Runモードのため実際の遮断はスキップ (安全モード)")
         return execute_generated_payload(payload, dry_run=True, available_interfaces=available_interfaces, interface=interface)
 
-    success = execute_generated_payload(payload, dry_run=False, available_interfaces=available_interfaces, interface=interface)
+    success = execute_generated_payload(
+        payload,
+        dry_run=False,
+        available_interfaces=available_interfaces,
+        interface=interface,
+        approval_verified=approval_verified,
+    )
 
     if success:
         log.warning("\033[1;33m[RECOVERY_PROTOCOL] 介入後の復旧には以下を実行してください:\033[0m")
@@ -6041,6 +6194,7 @@ def execute_kill_switch(interface: str | None, dry_run: bool, available_interfac
                 log.warning(f"\033[1;33m  - sudo ip link set {iface} up\033[0m")
     else:
         log.error("    → すべての遮断コマンドが失敗しました。sudo 権限またはコマンドの有無を確認してください。")
+    return success
 
 
 def _disable_all_network_interfaces(available_interfaces: list[str] | None = None) -> bool:

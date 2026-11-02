@@ -396,3 +396,146 @@ def verify_approval_bundle(
         seen.add(signer_id)
         accepted.append(signer_id)
     return tuple(accepted)
+
+
+def generate_operator_keypair(operator_id: str) -> dict[str, bytes | str]:
+    """Generate an Ed25519 operator keypair for quorum signing and verification."""
+    if not _CRYPTOGRAPHY_AVAILABLE or serialization is None:
+        raise QuorumError("cryptography library is required for Ed25519 quorum operations")
+    signer_id = _validate_signer_id(operator_id)
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    return {
+        "operator_id": signer_id,
+        "private_key_pem": private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ),
+        "public_key_pem": public_key.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ),
+    }
+
+
+def create_quorum_challenge(
+    operation: str,
+    parameters: Mapping[str, object] | None = None,
+    *,
+    required_m: int = 2,
+    total_n: int = 2,
+    ttl_sec: int = 300,
+    now: int = 1_700_000_000,
+    challenge_id: str = "chg-default",
+) -> dict[str, object]:
+    """Build a canonical M-of-N operational quorum challenge document."""
+    if not isinstance(operation, str) or not operation.strip():
+        raise QuorumError("Quorum challenge operation must be a non-empty string")
+    if required_m < 2 or total_n < required_m or total_n > MAX_APPROVALS:
+        raise QuorumError("Quorum challenge threshold must satisfy 2 <= M <= N <= 3")
+    issued_at = int(now)
+    expires_at = issued_at + max(1, int(ttl_sec))
+    doc: dict[str, object] = {
+        "version": 1,
+        "challenge_id": str(challenge_id),
+        "operation": operation,
+        "parameters": dict(parameters or {}),
+        "required_m": int(required_m),
+        "total_n": int(total_n),
+        "issued_at": issued_at,
+        "expires_at": expires_at,
+    }
+    return doc
+
+
+def _canonical_challenge_bytes(challenge_document: Mapping[str, object]) -> bytes:
+    return json.dumps(dict(challenge_document), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def sign_quorum_challenge(
+    challenge_document: Mapping[str, object],
+    *,
+    operator_id: str,
+    private_key_pem: bytes,
+    signed_at: int | None = None,
+) -> dict[str, object]:
+    """Sign a structured quorum challenge document with an operator Ed25519 private key."""
+    del signed_at
+    if not _CRYPTOGRAPHY_AVAILABLE or serialization is None:
+        raise QuorumError("cryptography library is required for Ed25519 quorum operations")
+    signer_id = _validate_signer_id(operator_id)
+    private_key = serialization.load_pem_private_key(private_key_pem, password=None)
+    if not isinstance(private_key, Ed25519PrivateKey):
+        raise QuorumError("Operator private key must use Ed25519")
+    sig = private_key.sign(_canonical_challenge_bytes(challenge_document))
+    return {
+        "signer_id": signer_id,
+        "signature": base64.b64encode(sig).decode("ascii"),
+    }
+
+
+def build_quorum_bundle(
+    challenge_document: Mapping[str, object],
+    signatures: list[Mapping[str, object]],
+) -> dict[str, object]:
+    """Assemble a canonical approval bundle from operator signatures."""
+    del challenge_document
+    return {
+        "version": 1,
+        "approvals": [
+            {
+                "signer_id": str(entry["signer_id"]),
+                "signature": str(entry["signature"]),
+            }
+            for entry in signatures
+        ],
+    }
+
+
+def verify_quorum_bundle(
+    approval_bundle: Mapping[str, object] | bytes,
+    *,
+    challenge_document: Mapping[str, object],
+    trusted_keys: Mapping[str, bytes | Ed25519PublicKey],
+    expected_operation: str | None = None,
+    now: int | None = None,
+) -> dict[str, object]:
+    """Verify a structured M-of-N Ed25519 quorum approval bundle against challenge_document."""
+    if not _CRYPTOGRAPHY_AVAILABLE or serialization is None:
+        raise QuorumError("cryptography library is required for Ed25519 quorum operations")
+    if not isinstance(challenge_document, Mapping):
+        raise QuorumError("challenge_document must be a mapping")
+    if expected_operation is not None and challenge_document.get("operation") != expected_operation:
+        raise QuorumError("Quorum challenge operation mismatch")
+    if now is not None:
+        expires_at = challenge_document.get("expires_at")
+        if isinstance(expires_at, int) and int(now) > expires_at:
+            raise QuorumError("Quorum challenge has expired")
+
+    threshold = int(challenge_document.get("required_m", 2))
+    loaded_keys: dict[str, Ed25519PublicKey] = {}
+    for signer_id, raw_key in trusted_keys.items():
+        if isinstance(raw_key, Ed25519PublicKey):
+            loaded_keys[signer_id] = raw_key
+        elif isinstance(raw_key, (bytes, bytearray)):
+            pub = serialization.load_pem_public_key(bytes(raw_key))
+            if not isinstance(pub, Ed25519PublicKey):
+                raise QuorumError("Trusted key is not Ed25519")
+            loaded_keys[signer_id] = pub
+        else:
+            raise QuorumError("Unsupported trusted key format")
+
+    bundle_bytes = (
+        approval_bundle
+        if isinstance(approval_bundle, bytes)
+        else json.dumps(dict(approval_bundle), sort_keys=True, separators=(",", ":")).encode("ascii")
+    )
+    accepted = verify_approval_bundle(
+        _canonical_challenge_bytes(challenge_document),
+        bundle_bytes,
+        loaded_keys,
+        threshold=threshold,
+    )
+    return {"verified": True, "signers": accepted}
+

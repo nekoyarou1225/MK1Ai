@@ -21,6 +21,7 @@ import mk1_firewall
 ROOT_DIR = Path(__file__).resolve().parent
 
 REPORTS = [
+    ("docs/MK1AI_COMPLETE_SPECIFICATION_2026-11-01.md", "0. Complete Specification (最新完全技術仕様書)"),
     ("MK1AI_REMEDIATION_REPORT.md", "1. Remediation Report (修正項目一覧)"),
     ("MK1AI_XDP_GAP_ANALYSIS.md", "2. XDP Gap Analysis (XDPすり抜け根本原因)"),
     ("MK1AI_XDP_REDESIGN.md", "3. XDP Redesign & Diff (XDP再設計・Diff案)"),
@@ -28,6 +29,8 @@ REPORTS = [
     ("MK1AI_REGRESSION_REPORT.md", "5. Regression Report (修正前後比較)"),
     ("MK1AI_PERFORMANCE_ROADMAP.md", "6. Performance Roadmap (1.6Tbps / 5Pbps計画)"),
 ]
+
+_CACHED_CHECKS: list[dict[str, object]] | None = None
 
 
 def _make_ipv4_tcp(
@@ -187,17 +190,34 @@ def run_live_verification_checks() -> list[dict[str, object]]:
     return checks
 
 
+def get_verification_checks(force_refresh: bool = False) -> list[dict[str, object]]:
+    global _CACHED_CHECKS
+    if _CACHED_CHECKS is None or force_refresh:
+        _CACHED_CHECKS = run_live_verification_checks()
+    return _CACHED_CHECKS
+
+
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 class AuditHTTPRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/health":
+        if parsed.path in ("/api/health", "/health", "/healthz"):
             self._send_json({"status": "ok", "project": "MK1Ai Sovereign-Airgap"})
             return
         if parsed.path == "/api/checks":
-            self._send_json({"checks": run_live_verification_checks()})
+            self._send_json({"checks": get_verification_checks(force_refresh=True)})
             return
 
         query = parse_qs(parsed.query)
@@ -208,7 +228,7 @@ class AuditHTTPRequestHandler(BaseHTTPRequestHandler):
 
         doc_path = ROOT_DIR / selected_doc
         doc_content = doc_path.read_text(encoding="utf-8") if doc_path.exists() else "# Document not found"
-        checks = run_live_verification_checks()
+        checks = get_verification_checks(force_refresh=False)
         self._send_html(self._render_dashboard(selected_doc, doc_content, checks))
 
     def _send_json(self, payload: dict[str, object]) -> None:
@@ -442,7 +462,7 @@ class AuditHTTPRequestHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     port = int(os.environ.get("PORT", 3000))
-    server = ThreadingHTTPServer(("0.0.0.0", port), AuditHTTPRequestHandler)
+    server = ReusableThreadingHTTPServer(("0.0.0.0", port), AuditHTTPRequestHandler)
     print(f"[MK1Ai Audit Server] Listening on http://0.0.0.0:{port}", flush=True)
     server.serve_forever()
 

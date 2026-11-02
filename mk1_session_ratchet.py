@@ -76,6 +76,7 @@ class SessionRatchet:
         self._send_sequence = 0
         self._receive_sequence = 0
         self._destroyed = False
+        self._destroy_callbacks: list[Callable[["SessionRatchet"], None]] = []
         self._lock = threading.RLock()
         try:
             self._send_chain = bytearray(HKDF(
@@ -104,6 +105,10 @@ class SessionRatchet:
             raise
         finally:
             mk1_memory_guard.wipe_buffer(session_secret)
+
+    def register_destroy_callback(self, callback: Callable[["SessionRatchet"], None]) -> None:
+        with self._lock:
+            self._destroy_callbacks.append(callback)
 
     def _check_live(self, *, sending: bool) -> None:
         if self._destroyed:
@@ -175,6 +180,10 @@ class SessionRatchet:
         mk1_memory_guard.wipe_buffer(self._send_chain)
         mk1_memory_guard.wipe_buffer(self._receive_chain)
         self._destroyed = True
+        callbacks = list(self._destroy_callbacks)
+        self._destroy_callbacks.clear()
+        for callback in callbacks:
+            callback(self)
 
     def destroy(self) -> None:
         with self._lock:

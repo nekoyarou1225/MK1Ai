@@ -856,9 +856,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
         allowed_routes = registration_routes if self.state.config.role == "enrollment" else login_routes
         if route not in allowed_routes:
+            raw_len = self.headers.get("Content-Length", "")
+            if raw_len.isascii() and raw_len.isdigit() and int(raw_len) <= MAX_REQUEST_BYTES:
+                self.rfile.read(int(raw_len))
             self._error(HTTPStatus.NOT_FOUND, "Not found")
             return
         if not self._check_rate_limit(route):
+            raw_len = self.headers.get("Content-Length", "")
+            if raw_len.isascii() and raw_len.isdigit() and int(raw_len) <= MAX_REQUEST_BYTES:
+                self.rfile.read(int(raw_len))
             return
         try:
             payload = self._read_json_body()

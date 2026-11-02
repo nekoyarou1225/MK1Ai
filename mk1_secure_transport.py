@@ -32,7 +32,10 @@ from mk1_session_ratchet import SessionRatchet, SessionRatchetError
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from pqcrypto.kem import ml_kem_768, ml_kem_1024  # type: ignore[reportMissingModuleSource]
 from pqcrypto.kem.ml_kem_768 import decaps, encaps  # type: ignore[reportMissingModuleSource]
+
+SUPPORTED_PQC_ALGORITHMS = ("ML-KEM-768", "ML-KEM-1024")
 
 
 class SecureTransportError(RuntimeError):
@@ -225,13 +228,21 @@ def set_memory_guard_enabled(enabled: bool) -> None:
     with _TRANSPORT_STATE_LOCK:
         mk1_memory_guard.set_enabled(enabled)
         envelopes = tuple(_ACTIVE_ENVELOPES)
+        ratchets = tuple(_ACTIVE_RATCHETS)
         if not enabled:
             for envelope in envelopes:
                 mk1_memory_guard.unlock_buffer(envelope.key)
+            for ratchet in ratchets:
+                mk1_memory_guard.unlock_buffer(ratchet._send_chain)
+                mk1_memory_guard.unlock_buffer(ratchet._receive_chain)
             return
         try:
             for envelope in envelopes:
                 mk1_memory_guard.lock_buffer(envelope.key)
+            for ratchet in ratchets:
+                if not ratchet.destroyed:
+                    mk1_memory_guard.lock_buffer(ratchet._send_chain)
+                    mk1_memory_guard.lock_buffer(ratchet._receive_chain)
         except OSError:
             for envelope in envelopes:
                 mk1_memory_guard.unlock_buffer(envelope.key)
@@ -327,6 +338,7 @@ def create_ratcheted_session(
         _require_transport_enabled()
         require_device_not_revoked(device_id)
         ratchet = SessionRatchet(shared_secret, context=context, role=role)
+        ratchet.register_destroy_callback(_ACTIVE_RATCHETS.discard)
         _ACTIVE_RATCHETS.add(ratchet)
         return ratchet
 
@@ -512,6 +524,16 @@ def _request_aad(method: str, path: str, fingerprint: str, kem_ciphertext: bytes
     ))
 
 
+def _select_kem_suite(key_bytes: bytes, *, is_private: bool = False) -> tuple[Any, bytes]:
+    if is_private:
+        if len(key_bytes) == ml_kem_1024.SECRET_KEY_SIZE:
+            return ml_kem_1024, b"MK1-RSI-ML-KEM-1024-AES-256-GCM-v1"
+        return ml_kem_768, b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1"
+    if len(key_bytes) == ml_kem_1024.PUBLIC_KEY_SIZE:
+        return ml_kem_1024, b"MK1-RSI-ML-KEM-1024-AES-256-GCM-v1"
+    return ml_kem_768, b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1"
+
+
 def create_encrypted_request(
     public_key: bytes,
     payload: dict[str, Any],
@@ -521,7 +543,8 @@ def create_encrypted_request(
 ) -> EncryptedRequest:
     with _TRANSPORT_STATE_LOCK:
         _require_transport_enabled()
-        kem_ciphertext, shared_secret_bytes = encaps(public_key)
+        kem_mod, kdf_info = _select_kem_suite(public_key, is_private=False)
+        kem_ciphertext, shared_secret_bytes = kem_mod.encaps(public_key)
         shared_secret = bytearray(shared_secret_bytes)
         del shared_secret_bytes
         key = bytearray()
@@ -533,7 +556,7 @@ def create_encrypted_request(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=hashlib.sha256(aad).digest(),
-                info=b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1",
+                info=kdf_info,
             ).derive(shared_secret)
             key.extend(derived_key)
             del derived_key
@@ -573,7 +596,8 @@ def encrypt_server_response(
     fingerprint: str,
 ) -> bytes:
     aad = _request_aad(method, path, fingerprint, kem_ciphertext)
-    shared_secret_bytes = decaps(private_key, kem_ciphertext)
+    kem_mod, kdf_info = _select_kem_suite(private_key, is_private=True)
+    shared_secret_bytes = kem_mod.decaps(private_key, kem_ciphertext)
     shared_secret = bytearray(shared_secret_bytes)
     del shared_secret_bytes
     key = bytearray()
@@ -584,7 +608,7 @@ def encrypt_server_response(
             algorithm=hashes.SHA256(),
             length=32,
             salt=hashlib.sha256(aad).digest(),
-            info=b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1",
+            info=kdf_info,
         ).derive(shared_secret)
         key.extend(derived_key)
         del derived_key
@@ -634,7 +658,7 @@ def pinned_server_public_key(
         document = response.json()
         public_key = base64.b64decode(document["public_key"], validate=True)
         fingerprint = hashlib.sha256(public_key).hexdigest()
-        if document.get("algorithm") != "ML-KEM-768":
+        if document.get("algorithm") not in SUPPORTED_PQC_ALGORITHMS:
             raise SecureTransportError("Colab server uses an unsupported PQC algorithm")
         if not hmac.compare_digest(fingerprint, expected_fingerprint.lower()):
             raise SecureTransportError("Colab ML-KEM public-key pin does not match")

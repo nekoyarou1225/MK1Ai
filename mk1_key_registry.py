@@ -30,7 +30,37 @@ ALLOWED_PURPOSES = frozenset({
     "configuration-signing",
     "update-verification",
     "wireguard-binding",
+    "qkd-hybrid-session",
+    "one-tap-kek-wrap",
 })
+
+ALLOWED_SECURITY_ZONES = frozenset({
+    "HONMARU",
+    "INNER_1",
+    "INNER_2",
+    "INNER_3",
+    "INNER_4",
+    "OUTER_1",
+    "OUTER_2",
+    "OUTER_3",
+    "OUTER_4",
+})
+
+
+def verify_cross_zone_isolation(source_zone: str, target_zone: str) -> None:
+    """Enforce 9-zone key isolation: cross-zone key import into HONMARU is strictly prohibited."""
+    if source_zone not in ALLOWED_SECURITY_ZONES:
+        raise KeyRegistryError(f"Unknown source security zone: {source_zone!r}")
+    if target_zone not in ALLOWED_SECURITY_ZONES:
+        raise KeyRegistryError(f"Unknown target security zone: {target_zone!r}")
+    if source_zone != target_zone:
+        if target_zone == "HONMARU":
+            raise PermissionError(
+                f"Cross-zone key import from {source_zone} into HONMARU is strictly prohibited"
+            )
+        raise PermissionError(
+            f"Cross-zone key sharing between {source_zone} and {target_zone} is prohibited"
+        )
 
 
 @dataclass(frozen=True)
@@ -48,6 +78,7 @@ def derive_device_purpose_key(
     device_id: str,
     purpose: str,
     generation: int,
+    zone_id: str | None = None,
 ) -> bytearray:
     if not isinstance(root_key, bytearray) or len(root_key) < 32:
         raise TypeError("Root key must be a mutable buffer of at least 32 bytes")
@@ -57,6 +88,21 @@ def derive_device_purpose_key(
         raise KeyRegistryError("Unknown key purpose")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
         raise KeyRegistryError("Key generation must be a non-negative integer")
+    if zone_id is not None:
+        if zone_id not in ALLOWED_SECURITY_ZONES:
+            raise KeyRegistryError(f"Unknown security zone: {zone_id!r}")
+        if zone_id.startswith("OUTER_") and purpose in ("qkd-hybrid-session", "one-tap-kek-wrap"):
+            raise PermissionError(
+                f"OUTER honeypot zone {zone_id} is prohibited from deriving {purpose} keys"
+            )
+        info_bytes = (
+            b"MK1-device-purpose-key-v1\0"
+            + zone_id.encode("ascii")
+            + b"\0"
+            + purpose.encode("ascii")
+        )
+    else:
+        info_bytes = b"MK1-device-purpose-key-v1\0" + purpose.encode("ascii")
 
     salt = hashlib.sha384(
         bytes.fromhex(device_id) + generation.to_bytes(8, "big"),
@@ -65,7 +111,7 @@ def derive_device_purpose_key(
         algorithm=hashes.SHA384(),
         length=32,
         salt=salt,
-        info=b"MK1-device-purpose-key-v1\0" + purpose.encode("ascii"),
+        info=info_bytes,
     ).derive(root_key)
     key = bytearray(derived)
     del derived
