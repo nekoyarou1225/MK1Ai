@@ -730,5 +730,24 @@ def main() -> int:
     return 0
 
 
+DEPRECATED_WRAPPER = True
+SINGLE_SOURCE_OF_TRUTH = "airgap_ai_defender.py"
+MAX_SAFETY_LOOP_ITERATIONS = 3
+
+try:
+    from airgap_ai_defender import (
+        FAIL_CLOSED_ACTION,
+        SafetyExecutionLoop,
+        ingest_honeypot_shock_gas_features,
+        verify_10000_deterministic_cycles,
+    )
+except ImportError:
+    FAIL_CLOSED_ACTION = "FAIL_CLOSED_BLOCK"
+    SafetyExecutionLoop = None  # type: ignore[assignment]
+    ingest_honeypot_shock_gas_features = None  # type: ignore[assignment]
+    verify_10000_deterministic_cycles = None  # type: ignore[assignment]
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
+

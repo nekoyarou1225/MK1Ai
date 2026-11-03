@@ -196,6 +196,12 @@ def render_nft_transaction(
         "delete table inet mk1ai_quarantine",
         "add table inet mk1ai_quarantine",
         (
+            "add chain inet mk1ai_quarantine prerouting "
+            "{ type filter hook prerouting priority -450; policy drop; }"
+        ),
+        "add rule inet mk1ai_quarantine prerouting ip frag-off & 0x1fff != 0 drop",
+        "add rule inet mk1ai_quarantine prerouting ip6 nexthdr 44 ip6 frag-off & 0xfff8 != 0 drop",
+        (
             "add chain inet mk1ai_quarantine input "
             "{ type filter hook input priority -10; policy drop; }"
         ),
@@ -238,3 +244,37 @@ def render_nft_transaction(
                     ),
                 ))
     return "\n".join(lines) + "\n"
+
+
+def verify_nft_prerouting_and_fragment_order(script: str | None = None) -> dict[str, object]:
+    """Statically verify prerouting hook (-450), DROP default policy, and early IPv4/IPv6 non-initial fragment drops."""
+    target = script if script is not None else render_nft_transaction(mode="full_isolation")
+    prerouting_chain = (
+        "add chain inet mk1ai_quarantine prerouting "
+        "{ type filter hook prerouting priority -450; policy drop; }"
+    )
+    ipv4_frag_drop = "add rule inet mk1ai_quarantine prerouting ip frag-off & 0x1fff != 0 drop"
+    ipv6_frag_drop = "add rule inet mk1ai_quarantine prerouting ip6 nexthdr 44 ip6 frag-off & 0xfff8 != 0 drop"
+    input_chain = (
+        "add chain inet mk1ai_quarantine input "
+        "{ type filter hook input priority -10; policy drop; }"
+    )
+    has_all = all(
+        token in target
+        for token in (prerouting_chain, ipv4_frag_drop, ipv6_frag_drop, input_chain)
+    )
+    order_valid = False
+    if has_all:
+        idx_pre = target.index(prerouting_chain)
+        idx_v4 = target.index(ipv4_frag_drop)
+        idx_v6 = target.index(ipv6_frag_drop)
+        idx_in = target.index(input_chain)
+        order_valid = idx_pre < idx_v4 < idx_v6 < idx_in
+    return {
+        "prerouting_priority_minus_450": prerouting_chain in target,
+        "default_policy_drop": "policy drop;" in target,
+        "ipv4_non_initial_fragment_early_drop": ipv4_frag_drop in target,
+        "ipv6_non_initial_fragment_early_drop": ipv6_frag_drop in target,
+        "strict_rule_order_verified": order_valid,
+    }
+

@@ -70,6 +70,30 @@ class NftSupportTest(unittest.TestCase):
             self.assertFalse(mk1_firewall.remove_nft_policy())
         self.assertEqual(mk1_firewall.last_nft_failure, "nftables の解除にはroot権限が必要です")
 
+    def test_prerouting_priority_minus_450_fragment_drops_and_ebpf_9stage_matrix(self):
+        import mk1_render_nft
+        import mk1_xdp_controller
+
+        nft_check = mk1_firewall.verify_nft_prerouting_and_fragment_order()
+        self.assertTrue(nft_check["prerouting_priority_minus_450"])
+        self.assertTrue(nft_check["default_policy_drop"])
+        self.assertTrue(nft_check["ipv4_non_initial_fragment_early_drop"])
+        self.assertTrue(nft_check["ipv6_non_initial_fragment_early_drop"])
+        self.assertTrue(nft_check["strict_rule_order_verified"])
+
+        rendered_check = mk1_render_nft.verify_rendered_nft_ruleset(
+            mk1_firewall.render_nft_transaction(mode="full_isolation")
+        )
+        self.assertTrue(rendered_check["prerouting_priority_minus_450"])
+        self.assertTrue(rendered_check["ipv4_non_initial_fragment_early_drop"])
+        self.assertTrue(rendered_check["ipv6_non_initial_fragment_early_drop"])
+
+        ebpf_matrix = mk1_xdp_controller.verify_ebpf_9stage_matrix()
+        self.assertTrue(ebpf_matrix["stages_1_to_4_verified"])
+        self.assertEqual(ebpf_matrix["kernel_attach_status"], "NOT_TESTED")
+        self.assertEqual(ebpf_matrix["physical_nic_status"], "NOT_CONNECTED")
+
 
 if __name__ == "__main__":
     unittest.main()
+

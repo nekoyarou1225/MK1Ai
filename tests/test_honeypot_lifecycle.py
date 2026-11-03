@@ -262,6 +262,91 @@ class HoneypotLifecycleTest(unittest.TestCase):
         self.assertEqual(res["status"], "COMMITTED")
         self.assertIn("Outer-1", mgr2.active_nodes)
 
+    def test_concentric_4_plus_4_shock_gas_ring_buffer_and_ai_safety_loop(self) -> None:
+        from airgap_ai_defender import (
+            MAX_SAFETY_LOOP_ITERATIONS,
+            SafetyExecutionLoop,
+            verify_10000_deterministic_cycles,
+        )
+        from mk1_honeypot import FixedRingBuffer
+        import mk1_hybrid_kem
+        import mk1_key_derivation
+        import mk1_memory_guard
+
+        # 1. FixedRingBuffer pre-allocated capacity never grows dynamically
+        ring = FixedRingBuffer(capacity_bytes=128, max_records=4)
+        for i in range(10):
+            meta = ring.append_payload(f"SHOCK-GAS-PAYLOAD-{i:02d}".encode("ascii"))
+            self.assertEqual(meta["capacity"], 128)
+        self.assertEqual(ring.capacity_bytes, 128)
+        self.assertEqual(ring.read_latest(), b"SHOCK-GAS-PAYLOAD-09")
+
+        # 2. Outer honeypot contact seals airgap, records shock gas, and hands off 10-feature vector to AI
+        mgr = HoneypotManager(
+            capacity=self.abundant_host,
+            catalog_verify_key=self.catalog_key,
+            license_limit=8,
+            admin_policy_limit=8,
+            allowed_os_families=("debian",),
+            custom_os_allowed=False,
+            auto_rebuild_allowed=True,
+        )
+        m_deb, b_deb = self._make_signed_image(image_id="deb12", os_family="debian", os_version="12")
+        # 5 outer honeypots (> MAX_OUTER_HONEYPOTS=4) is rejected even when total <= 8
+        with self.assertRaisesRegex(HoneypotPolicyViolationError, "OUTER limit"):
+            mgr.reconfigure_topology(
+                [HoneypotNodeSpec(node_id=f"Outer-{i}", layer="outer", zone_index=i, manifest=m_deb) for i in range(1, 6)],
+                {"deb12": b_deb},
+            )
+
+        # Valid 4 Outer + 4 Inner = 8 concentric topology succeeds
+        concentric_specs = [
+            HoneypotNodeSpec(node_id=f"Outer-{i}", layer="outer", zone_index=i, manifest=m_deb)
+            for i in range(1, 5)
+        ] + [
+            HoneypotNodeSpec(node_id=f"Inner-{i}", layer="inner", zone_index=i + 4, manifest=m_deb)
+            for i in range(1, 5)
+        ]
+        commit = mgr.reconfigure_topology(concentric_specs, {"deb12": b_deb})
+        self.assertEqual(commit["outer_count"], 4)
+        self.assertEqual(commit["inner_count"], 4)
+
+        ev = mgr.report_honeypot_security_event(
+            "Outer-1",
+            event_type="EXPLOIT_PAYLOAD",
+            attacker_ip="203.0.113.99",
+            detail="Shellcode probe",
+            attack_payload=b"GET /../../etc/shadow HTTP/1.1\r\n\r\n",
+        )
+        self.assertTrue(ev["airgap_sealed"])
+        self.assertEqual(ev["quarantine_state"], "FAIL_CLOSED_BLOCK")
+        self.assertEqual(ev["ai_handoff"]["action"], "FAIL_CLOSED_BLOCK")
+        self.assertEqual(len(ev["ai_handoff"]["feature_vector"]), 10)
+
+        # 3. SafetyExecutionLoop max 3 iterations & 10,000-cycle 0 FP / 0 FN verification
+        self.assertEqual(MAX_SAFETY_LOOP_ITERATIONS, 3)
+        with self.assertRaises(ValueError):
+            SafetyExecutionLoop(max_iterations=4)
+        timeout_res = SafetyExecutionLoop().evaluate(b"PING", simulate_timeout=True)
+        self.assertEqual(timeout_res["action"], "FAIL_CLOSED_BLOCK")
+        stats_10k = verify_10000_deterministic_cycles(10000)
+        self.assertTrue(stats_10k["zero_fp_fn_verified"])
+        self.assertEqual(stats_10k["false_positives"], 0)
+        self.assertEqual(stats_10k["false_negatives"], 0)
+        self.assertLessEqual(stats_10k["max_observed_iterations"], 3)
+
+        # 4. SecureBuffer zeroization and production C-extension fail-closed check
+        raw_secret = bytearray(b"0123456789abcdef0123456789abcdef")
+        with mk1_memory_guard.SecureBuffer(raw_secret) as sbuf:
+            self.assertEqual(raw_secret, bytearray(32))  # source wiped immediately
+            self.assertEqual(len(sbuf), 32)
+        self.assertTrue(sbuf.is_zeroized)
+        with self.assertRaisesRegex(RuntimeError, "FAIL_CLOSED_BLOCK"):
+            mk1_key_derivation.verify_crypto_provider_integrity(production_mode=True)
+        with self.assertRaisesRegex(RuntimeError, "FAIL_CLOSED_BLOCK"):
+            mk1_hybrid_kem.verify_crypto_provider_integrity(production_mode=True)
+
 
 if __name__ == "__main__":
     unittest.main()
+

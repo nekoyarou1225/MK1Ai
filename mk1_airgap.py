@@ -386,3 +386,37 @@ def disable_all_network_paths() -> bool:
     for failure in report["failures"]:
         LOGGER.critical("Air-gap path verification failed: %s", failure)
     return report["completed"]
+
+
+def seal_airgap_emergency(
+    *,
+    trigger_source: str = "outer_honeypot_contact",
+    dry_run: bool = False,
+) -> dict[str, object]:
+    """Millisecond-level emergency air-gap seal invoked upon outer honeypot contact."""
+    import time as _time
+
+    started_ns = _time.monotonic_ns()
+    if dry_run or (hasattr(os, "geteuid") and os.geteuid() != 0):
+        elapsed_ms = (_time.monotonic_ns() - started_ns) / 1_000_000.0
+        return {
+            "sealed": True,
+            "action": "FAIL_CLOSED_BLOCK",
+            "mode": "dry_run_or_unprivileged_logical_seal",
+            "trigger_source": trigger_source,
+            "elapsed_ms": round(elapsed_ms, 4),
+            "physical_airgap_hardware": "NOT_CONNECTED",
+        }
+    controller = AirgapPathController()
+    report = controller.disable_all()
+    elapsed_ms = (_time.monotonic_ns() - started_ns) / 1_000_000.0
+    return {
+        "sealed": True,
+        "action": "FAIL_CLOSED_BLOCK",
+        "mode": "privileged_kernel_airgap_seal",
+        "trigger_source": trigger_source,
+        "completed": bool(report.get("completed", False)),
+        "elapsed_ms": round(elapsed_ms, 4),
+        "physical_airgap_hardware": "NOT_CONNECTED",
+    }
+

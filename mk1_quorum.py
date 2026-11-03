@@ -539,3 +539,238 @@ def verify_quorum_bundle(
     )
     return {"verified": True, "signers": accepted}
 
+
+REQUIRED_ADMIN_QUORUM = 2
+
+
+class TwoAdminQuorumGate:
+    """Enforces Quorum = 2 distinct administrator Ed25519 approvals per event_id.
+
+    Protects critical operations (kill_switch, quarantine_release) against:
+    - Single-administrator execution or duplicate admin_id signing
+    - event_id replay (both in-memory and across process restarts via atomic ledger)
+    - Expired approval bundles
+    - Post-restart state tampering or corruption (fail-closed QuorumError)
+    """
+
+    def __init__(
+        self,
+        trusted_admin_keys: Mapping[str, bytes | Ed25519PublicKey],
+        *,
+        state_path: Path | str | None = None,
+    ) -> None:
+        if not _CRYPTOGRAPHY_AVAILABLE or serialization is None:
+            raise QuorumError("cryptography library is required for Ed25519 quorum operations")
+        if len(trusted_admin_keys) < REQUIRED_ADMIN_QUORUM:
+            raise QuorumError("TwoAdminQuorumGate requires at least 2 distinct administrators")
+        self._trusted_keys: dict[str, Ed25519PublicKey] = {}
+        raw_pub_set: set[bytes] = set()
+        for admin_id, key_obj in trusted_admin_keys.items():
+            clean_id = _validate_signer_id(admin_id)
+            if isinstance(key_obj, Ed25519PublicKey):
+                pub = key_obj
+            elif isinstance(key_obj, (bytes, bytearray)):
+                loaded = serialization.load_pem_public_key(bytes(key_obj))
+                if not isinstance(loaded, Ed25519PublicKey):
+                    raise QuorumError("Administrator public key must be Ed25519")
+                pub = loaded
+            else:
+                raise QuorumError("Unsupported administrator public key type")
+            raw_bytes = pub.public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            if raw_bytes in raw_pub_set:
+                raise QuorumError("Administrator Ed25519 public keys must be distinct")
+            raw_pub_set.add(raw_bytes)
+            self._trusted_keys[clean_id] = pub
+
+        self._state_path = Path(state_path) if state_path is not None else None
+        self._consumed_events: dict[str, dict[str, object]] = {}
+        self._max_observed_time: int = 0
+        if self._state_path is not None and self._state_path.exists():
+            self._load_persistent_state()
+
+    @staticmethod
+    def _compute_state_digest(consumed: Mapping[str, object], max_time: int) -> str:
+        import hashlib
+
+        body = json.dumps(
+            {"consumed_events": dict(consumed), "max_observed_time": int(max_time)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(b"MK1AI-QUORUM-STATE-v1:" + body).hexdigest()
+
+    def _load_persistent_state(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            raw = self._state_path.read_text(encoding="utf-8")
+            doc = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        except Exception as exc:
+            raise QuorumError("FAIL_CLOSED_BLOCK: Persistent quorum state is corrupted") from exc
+        if not isinstance(doc, dict) or set(doc) != {
+            "version",
+            "consumed_events",
+            "max_observed_time",
+            "integrity_sha256",
+        }:
+            raise QuorumError("FAIL_CLOSED_BLOCK: Persistent quorum state schema mismatch")
+        if doc.get("version") != 1 or not isinstance(doc.get("consumed_events"), dict):
+            raise QuorumError("FAIL_CLOSED_BLOCK: Persistent quorum state version/type invalid")
+        max_time = doc.get("max_observed_time")
+        if isinstance(max_time, bool) or not isinstance(max_time, int) or max_time < 0:
+            raise QuorumError("FAIL_CLOSED_BLOCK: Persistent quorum max_observed_time invalid")
+        expected_digest = self._compute_state_digest(doc["consumed_events"], max_time)
+        if doc.get("integrity_sha256") != expected_digest:
+            raise QuorumError("FAIL_CLOSED_BLOCK: Persistent quorum state integrity check failed")
+        self._consumed_events = dict(doc["consumed_events"])
+        self._max_observed_time = max_time
+
+    def _save_persistent_state(self) -> None:
+        if self._state_path is None:
+            return
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        digest = self._compute_state_digest(self._consumed_events, self._max_observed_time)
+        payload = json.dumps(
+            {
+                "version": 1,
+                "consumed_events": self._consumed_events,
+                "max_observed_time": self._max_observed_time,
+                "integrity_sha256": digest,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        tmp_path = self._state_path.with_suffix(".tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, self._state_path)
+
+    @staticmethod
+    def build_event_challenge(
+        *,
+        event_id: str,
+        operation: str,
+        issued_at: int,
+        ttl_sec: int = 300,
+        parameters: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        if not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 128:
+            raise QuorumError("event_id must be a non-empty string up to 128 chars")
+        if operation not in ("kill_switch", "quarantine_release", "policy_override"):
+            raise QuorumError(f"Unsupported critical quorum operation: {operation}")
+        if ttl_sec <= 0 or ttl_sec > 86_400:
+            raise QuorumError("ttl_sec must be between 1 and 86400 seconds")
+        return {
+            "version": 1,
+            "event_id": event_id.strip(),
+            "operation": operation,
+            "parameters": dict(parameters or {}),
+            "required_m": REQUIRED_ADMIN_QUORUM,
+            "issued_at": int(issued_at),
+            "expires_at": int(issued_at) + int(ttl_sec),
+        }
+
+    @staticmethod
+    def sign_event_challenge(
+        challenge: Mapping[str, object],
+        *,
+        admin_id: str,
+        private_key: Ed25519PrivateKey | bytes,
+    ) -> dict[str, str]:
+        signer_id = _validate_signer_id(admin_id)
+        if isinstance(private_key, (bytes, bytearray)):
+            loaded_priv = serialization.load_pem_private_key(bytes(private_key), password=None)
+            if not isinstance(loaded_priv, Ed25519PrivateKey):
+                raise QuorumError("Admin private key must be Ed25519")
+            priv = loaded_priv
+        elif isinstance(private_key, Ed25519PrivateKey):
+            priv = private_key
+        else:
+            raise QuorumError("Invalid admin private key")
+        msg = _canonical_challenge_bytes(challenge)
+        sig = priv.sign(msg)
+        return {
+            "signer_id": signer_id,
+            "signature": base64.b64encode(sig).decode("ascii"),
+        }
+
+    def authorize_event(
+        self,
+        challenge: Mapping[str, object],
+        approvals: list[Mapping[str, str]],
+        *,
+        expected_operation: str,
+        now: int,
+    ) -> dict[str, object]:
+        """Verify Quorum >= 2 distinct admins, check expiration & event_id replay, and commit."""
+        if self._state_path is not None and self._state_path.exists():
+            self._load_persistent_state()
+
+        if not isinstance(challenge, Mapping):
+            raise QuorumError("Challenge must be a mapping")
+        event_id = challenge.get("event_id")
+        if not isinstance(event_id, str) or not event_id.strip():
+            raise QuorumError("Challenge is missing a valid event_id")
+        event_id = event_id.strip()
+
+        if event_id in self._consumed_events:
+            raise QuorumError(f"FAIL_CLOSED_BLOCK: Replay of consumed event_id '{event_id}' rejected")
+
+        if challenge.get("operation") != expected_operation:
+            raise QuorumError("Challenge operation does not match expected_operation")
+
+        issued_at = challenge.get("issued_at")
+        expires_at = challenge.get("expires_at")
+        if (
+            isinstance(issued_at, bool)
+            or not isinstance(issued_at, int)
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, int)
+        ):
+            raise QuorumError("Challenge timestamps must be integers")
+
+        if int(now) < self._max_observed_time:
+            raise QuorumError("FAIL_CLOSED_BLOCK: Monotonic clock rollback detected in quorum gate")
+        if int(now) < issued_at:
+            raise QuorumError("Challenge issued_at is in the future")
+        if int(now) > expires_at:
+            raise QuorumError("FAIL_CLOSED_BLOCK: Quorum approval challenge has expired")
+
+        if not isinstance(approvals, list) or len(approvals) < REQUIRED_ADMIN_QUORUM:
+            raise QuorumError("Quorum = 2 distinct administrator approvals required")
+
+        bundle_bytes = json.dumps(
+            {"version": 1, "approvals": approvals},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+
+        accepted_signers = verify_approval_bundle(
+            _canonical_challenge_bytes(challenge),
+            bundle_bytes,
+            self._trusted_keys,
+            threshold=REQUIRED_ADMIN_QUORUM,
+        )
+        if len(set(accepted_signers)) < REQUIRED_ADMIN_QUORUM:
+            raise QuorumError("Quorum requires at least 2 distinct administrator identities")
+
+        self._max_observed_time = max(self._max_observed_time, int(now))
+        record = {
+            "event_id": event_id,
+            "operation": expected_operation,
+            "approved_by": list(accepted_signers),
+            "authorized_at": int(now),
+        }
+        self._consumed_events[event_id] = record
+        self._save_persistent_state()
+        return {
+            "authorized": True,
+            "quorum_met": True,
+            "event_id": event_id,
+            "operation": expected_operation,
+            "signers": accepted_signers,
+        }
+
+

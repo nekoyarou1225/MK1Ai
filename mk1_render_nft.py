@@ -50,6 +50,22 @@ def render_nft_template(
     return rendered
 
 
+def verify_rendered_nft_ruleset(rendered: str) -> dict[str, bool]:
+    """Statically verify rendered nftables template / transaction security properties."""
+    has_drop_policy = "policy drop;" in rendered
+    no_placeholders = re.search(r"\b(?:WG_[A-Z0-9_]+|MK1_[A-Z0-9_]+)\b", rendered) is None
+    has_prerouting_450 = "hook prerouting priority -450; policy drop;" in rendered
+    has_v4_frag_drop = "ip frag-off & 0x1fff != 0 drop" in rendered
+    has_v6_frag_drop = "ip6 nexthdr 44 ip6 frag-off & 0xfff8 != 0 drop" in rendered
+    return {
+        "default_policy_drop": has_drop_policy,
+        "no_unresolved_placeholders": no_placeholders,
+        "prerouting_priority_minus_450": has_prerouting_450,
+        "ipv4_non_initial_fragment_early_drop": has_v4_frag_drop,
+        "ipv6_non_initial_fragment_early_drop": has_v6_frag_drop,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template", type=Path, default=Path(__file__).with_name(
@@ -76,3 +92,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

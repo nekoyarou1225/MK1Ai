@@ -41,6 +41,82 @@ class HoneypotPolicyViolationError(HoneypotEngineError):
 
 
 MAX_SUPPORTED_HONEYPOTS = 8
+MAX_OUTER_HONEYPOTS = 4
+MAX_INNER_HONEYPOTS = 4
+DEFAULT_SHOCK_GAS_RING_BYTES = 64 * 1024
+
+
+class FixedRingBuffer:
+    """Pre-allocated fixed-length ring buffer for capturing attack payloads ('shock gas').
+
+    Uses a single fixed `bytearray` allocated at initialization with zero dynamic memory
+    growth (`malloc`) during attack spikes. Oldest bytes are overwritten in-place when full.
+    """
+
+    __slots__ = (
+        "_buffer",
+        "_capacity",
+        "_write_cursor",
+        "_total_bytes_written",
+        "_record_offsets",
+        "_max_records",
+    )
+
+    def __init__(self, capacity_bytes: int = DEFAULT_SHOCK_GAS_RING_BYTES, max_records: int = 64) -> None:
+        if isinstance(capacity_bytes, bool) or not isinstance(capacity_bytes, int) or capacity_bytes < 64:
+            raise ValueError("FixedRingBuffer capacity_bytes must be an integer >= 64")
+        if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records < 1:
+            raise ValueError("FixedRingBuffer max_records must be >= 1")
+        self._capacity = capacity_bytes
+        self._buffer = bytearray(capacity_bytes)
+        self._write_cursor = 0
+        self._total_bytes_written = 0
+        self._max_records = max_records
+        self._record_offsets: list[tuple[int, int]] = []
+
+    @property
+    def capacity_bytes(self) -> int:
+        return self._capacity
+
+    @property
+    def total_bytes_written(self) -> int:
+        return self._total_bytes_written
+
+    @property
+    def record_count(self) -> int:
+        return len(self._record_offsets)
+
+    def append_payload(self, payload: bytes | bytearray | memoryview) -> dict[str, int]:
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise TypeError("Shock-gas payload must be bytes-like")
+        raw = memoryview(payload)
+        length = min(len(raw), self._capacity)
+        if length == 0:
+            return {"offset": self._write_cursor, "length": 0, "capacity": self._capacity}
+        # If payload exceeds capacity, keep the tail slice fitting capacity
+        slice_view = raw[:length]
+        start = self._write_cursor
+        first_chunk = min(length, self._capacity - start)
+        self._buffer[start : start + first_chunk] = slice_view[:first_chunk]
+        remaining = length - first_chunk
+        if remaining > 0:
+            self._buffer[0:remaining] = slice_view[first_chunk : first_chunk + remaining]
+        self._write_cursor = (start + length) % self._capacity
+        self._total_bytes_written += length
+        if len(self._record_offsets) >= self._max_records:
+            self._record_offsets.pop(0)
+        self._record_offsets.append((start, length))
+        return {"offset": start, "length": length, "capacity": self._capacity}
+
+    def read_latest(self) -> bytes:
+        if not self._record_offsets:
+            return b""
+        start, length = self._record_offsets[-1]
+        first_chunk = min(length, self._capacity - start)
+        if length <= first_chunk:
+            return bytes(self._buffer[start : start + length])
+        remaining = length - first_chunk
+        return bytes(self._buffer[start : self._capacity]) + bytes(self._buffer[0:remaining])
 
 
 @dataclass(frozen=True)
@@ -116,12 +192,17 @@ def compute_effective_honeypot_limit(
     clamped_admin = min(MAX_SUPPORTED_HONEYPOTS, int(admin_policy_limit))
     hardware_limit = compute_hardware_honeypot_limit(capacity, reserved, slot_cost)
     effective = min(clamped_license, hardware_limit, clamped_admin)
+    outer_limit = min(MAX_OUTER_HONEYPOTS, (effective + 1) // 2)
+    inner_limit = min(MAX_INNER_HONEYPOTS, effective - outer_limit)
     return {
         "effective_limit": effective,
         "license_limit": clamped_license,
         "hardware_limit": hardware_limit,
         "admin_policy_limit": clamped_admin,
+        "max_outer_limit": outer_limit,
+        "max_inner_limit": inner_limit,
     }
+
 
 
 OFFICIAL_OS_CATALOG: dict[str, dict[str, dict[str, Any]]] = {
@@ -374,6 +455,11 @@ class HoneypotManager:
         self._core_isolated: bool = False
         self._emergency_events: list[dict[str, Any]] = []
         self._transaction_history: list[dict[str, Any]] = []
+        self._shock_gas_ring = FixedRingBuffer(capacity_bytes=DEFAULT_SHOCK_GAS_RING_BYTES)
+
+    @property
+    def shock_gas_ring_buffer(self) -> FixedRingBuffer:
+        return self._shock_gas_ring
 
     @property
     def core_isolated(self) -> bool:
@@ -441,6 +527,16 @@ class HoneypotManager:
                 raise HoneypotPolicyViolationError(
                     f"Requested {len(specs)} honeypots exceeds effective limit {effective_limit} "
                     f"(license={limits['license_limit']}, admin={limits['admin_policy_limit']})"
+                )
+            outer_requested = sum(1 for s in specs if s.layer == "outer")
+            inner_requested = sum(1 for s in specs if s.layer == "inner")
+            if outer_requested > MAX_OUTER_HONEYPOTS:
+                raise HoneypotPolicyViolationError(
+                    f"Requested {outer_requested} outer honeypots exceeds concentric OUTER limit {MAX_OUTER_HONEYPOTS}"
+                )
+            if inner_requested > MAX_INNER_HONEYPOTS:
+                raise HoneypotPolicyViolationError(
+                    f"Requested {inner_requested} inner honeypots exceeds concentric INNER limit {MAX_INNER_HONEYPOTS}"
                 )
             _maybe_fail(2, "validate_effective_limits")
 
@@ -537,20 +633,53 @@ class HoneypotManager:
         event_type: str,
         attacker_ip: str,
         detail: str,
+        attack_payload: bytes | None = None,
     ) -> dict[str, Any]:
-        """Trigger immediate CORE isolation on ANY scan or attack in ANY active honeypot."""
+        """Trigger immediate CORE isolation, air-gap/quarantine seal, shock-gas capture, and AI handoff."""
         if node_id not in self._nodes:
             raise HoneypotEngineError(f"Unknown honeypot node_id: {node_id}")
         node = self._nodes[node_id]
         timestamp = time.time()
 
-        # 1. Immediately isolate CORE (ANY_SCAN_OR_ATTACK_IN_ANY_ACTIVE_HONEYPOT policy)
+        # 1. Immediately isolate CORE and seal air-gap / quarantine in milliseconds
         self._core_isolated = True
         node.uplink_severed = True
         node.status = "ISOLATED"
         node.last_compromise_reason = f"{event_type}:{detail}"
 
-        # 2. Capture forensic snapshot before any rebuild
+        import mk1_airgap
+
+        airgap_seal = mk1_airgap.seal_airgap_emergency(
+            trigger_source=f"{node.spec.layer}:{node_id}:{event_type}",
+            dry_run=True,
+        )
+
+        # 2. Record attack payload ('shock gas') into pre-allocated fixed ring buffer (no dynamic malloc)
+        raw_shock_gas = (
+            bytes(attack_payload)
+            if attack_payload is not None
+            else f"{event_type}|{attacker_ip}|{detail}".encode("utf-8", errors="replace")
+        )
+        ring_meta = self._shock_gas_ring.append_payload(raw_shock_gas)
+
+        # 3. Hand off extracted feature vector to local Shared-Layer AI model
+        try:
+            from airgap_ai_defender import ingest_honeypot_shock_gas_features
+
+            ai_handoff = ingest_honeypot_shock_gas_features(
+                raw_shock_gas,
+                source_node_id=node_id,
+            )
+        except Exception as exc:
+            ai_handoff = {
+                "source_node_id": node_id,
+                "feature_vector": [1.0] * 10,
+                "action": "FAIL_CLOSED_BLOCK",
+                "block": True,
+                "error": str(exc),
+            }
+
+        # 4. Capture forensic snapshot before any rebuild
         snapshot = {
             "node_id": node_id,
             "layer": node.spec.layer,
@@ -560,10 +689,13 @@ class HoneypotManager:
             "detail": detail,
             "timestamp": timestamp,
             "image_sha256": node.spec.manifest.sha256_hex,
+            "shock_gas_ring": ring_meta,
+            "airgap_seal": airgap_seal,
+            "ai_handoff": ai_handoff,
         }
         node.forensic_snapshots.append(snapshot)
 
-        # 3. Auto-rebuild from verified golden image if enabled and permitted
+        # 5. Auto-rebuild from verified golden image if enabled and permitted
         rebuilt = False
         if node.spec.auto_rebuild and self._auto_rebuild_allowed:
             node.rebuild_count += 1
@@ -578,6 +710,10 @@ class HoneypotManager:
             "event_type": event_type,
             "attacker_ip": attacker_ip,
             "core_isolated": self._core_isolated,
+            "airgap_sealed": bool(airgap_seal.get("sealed", True)),
+            "quarantine_state": "FAIL_CLOSED_BLOCK",
+            "shock_gas_ring": ring_meta,
+            "ai_handoff": ai_handoff,
             "forensic_snapshot_captured": True,
             "auto_rebuilt": rebuilt,
             "rebuild_count": node.rebuild_count,
@@ -586,6 +722,7 @@ class HoneypotManager:
         if self._on_core_emergency_isolate is not None:
             self._on_core_emergency_isolate(node_id, event_record)
         return event_record
+
 
     def export_signed_config(self, signing_key: bytes) -> bytes:
         """Export current honeypot topology as a signed JSON configuration bundle."""

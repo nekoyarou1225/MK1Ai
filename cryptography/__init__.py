@@ -2,8 +2,12 @@
 
 from cryptography.exceptions import CryptographyError, InvalidSignature, InvalidTag
 
+_MK1_PURE_PYTHON_FALLBACK = True
+
 __all__ = [
     "CryptographyError",
     "InvalidSignature",
     "InvalidTag",
+    "_MK1_PURE_PYTHON_FALLBACK",
 ]
+

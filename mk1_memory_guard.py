@@ -252,3 +252,96 @@ def wipe_buffer(buffer: bytearray) -> None:
 def protect_active_secret_buffers(buffers: tuple[bytearray, ...]) -> None:
     for buffer in buffers:
         lock_buffer(buffer)
+
+
+class SecureBuffer:
+    """Fixed-length mutable secret buffer with mlock protection and explicit_bzero zeroization.
+
+    Prevents retention of secret keys, shared secrets, and session keys in immutable
+    Python `bytes` or `str` objects and guarantees immediate zeroization on destruction.
+    """
+
+    __slots__ = ("_buffer", "_size", "_zeroized")
+
+    def __init__(
+        self,
+        size_or_initial: int | bytes | bytearray | memoryview,
+        *,
+        wipe_source: bool = True,
+    ) -> None:
+        if isinstance(size_or_initial, int) and not isinstance(size_or_initial, bool):
+            if size_or_initial <= 0 or size_or_initial > 1024 * 1024:
+                raise ValueError("SecureBuffer size must be between 1 and 1048576 bytes")
+            self._size = size_or_initial
+            self._buffer = bytearray(self._size)
+        elif isinstance(size_or_initial, (bytes, bytearray, memoryview)):
+            if len(size_or_initial) == 0 or len(size_or_initial) > 1024 * 1024:
+                raise ValueError("SecureBuffer payload must be between 1 and 1048576 bytes")
+            self._size = len(size_or_initial)
+            self._buffer = bytearray(size_or_initial)
+            if wipe_source and isinstance(size_or_initial, bytearray):
+                wipe_buffer(size_or_initial)
+        else:
+            raise TypeError("SecureBuffer requires an integer size or byte-like buffer")
+        self._zeroized = False
+        try:
+            lock_buffer(self._buffer)
+        except OSError:
+            wipe_buffer(self._buffer)
+            self._zeroized = True
+            raise
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def is_zeroized(self) -> bool:
+        return self._zeroized
+
+    @property
+    def raw_buffer(self) -> bytearray:
+        if self._zeroized:
+            raise RuntimeError("FAIL_CLOSED_BLOCK: SecureBuffer has already been zeroized")
+        return self._buffer
+
+    def as_memoryview(self) -> memoryview:
+        if self._zeroized:
+            raise RuntimeError("FAIL_CLOSED_BLOCK: SecureBuffer has already been zeroized")
+        return memoryview(self._buffer)
+
+    def write(self, data: bytes | bytearray | memoryview, offset: int = 0) -> None:
+        if self._zeroized:
+            raise RuntimeError("FAIL_CLOSED_BLOCK: Cannot write to zeroized SecureBuffer")
+        if offset < 0 or offset + len(data) > self._size:
+            raise ValueError("Write exceeds fixed SecureBuffer capacity")
+        self._buffer[offset : offset + len(data)] = data
+        if isinstance(data, bytearray):
+            wipe_buffer(data)
+
+    def zeroize(self) -> None:
+        if not self._zeroized:
+            wipe_buffer(self._buffer)
+            self._zeroized = True
+
+    def destroy(self) -> None:
+        self.zeroize()
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __enter__(self) -> SecureBuffer:
+        if self._zeroized:
+            raise RuntimeError("FAIL_CLOSED_BLOCK: Cannot enter zeroized SecureBuffer")
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        self.zeroize()
+
+    def __del__(self) -> None:
+        try:
+            self.zeroize()
+        except Exception:
+            for idx in range(len(getattr(self, "_buffer", ()))):
+                self._buffer[idx] = 0
+

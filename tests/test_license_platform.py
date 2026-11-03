@@ -263,6 +263,83 @@ class LicensePlatformTest(unittest.TestCase):
         self.assertNotIn("bob", grp.members)
         self.assertTrue(engine.verify_audit_chain())
 
+    def test_thunderhole_32_plans_kyc_biometric_hashes_and_watermark_traceability(self) -> None:
+        from mk1_license import (
+            THUNDERHOLE_PLAN_CATALOG,
+            embed_audit_log_watermark,
+            embed_packet_watermark,
+            trace_leak_owner,
+            validate_kyc_biometric_hashes,
+        )
+
+        # 1. Verify all 32 plans (4 categories x 8 sub-tiers) exist and enforce CORE invariants
+        self.assertEqual(len(THUNDERHOLE_PLAN_CATALOG), 32)
+        for code, ent in THUNDERHOLE_PLAN_CATALOG.items():
+            self.assertTrue(ent.core_isolation_enabled, code)
+            self.assertTrue(ent.attack_detection_enabled, code)
+            self.assertTrue(ent.emergency_kill_switch_enabled, code)
+
+        # 2. Reject 12-digit My Number and raw facial image data
+        valid_kyc = "a" * 64
+        valid_mesh = "b" * 64
+        with self.assertRaisesRegex(LicenseVerificationError, "My Number"):
+            validate_kyc_biometric_hashes(
+                kyc_identity_hash="123456789012",
+                biometric_3d_mesh_hash=valid_mesh,
+                device_fingerprint=self.device_fp,
+            )
+        with self.assertRaisesRegex(LicenseVerificationError, "Raw image"):
+            validate_kyc_biometric_hashes(
+                kyc_identity_hash=valid_kyc,
+                biometric_3d_mesh_hash=b"\x89PNG\r\n\x1a\nrawface",
+                device_fingerprint=self.device_fp,
+            )
+
+        # 3. Issue RESEARCH.ULTRA_MAX 30-day offline trial with KYC + 3D mesh hash + watermark
+        trial_token = issue_signed_license(
+            SignedLicenseToken(
+                license_id="TRIAL-RES-001",
+                customer_org="AegisLab Trial User",
+                tier=PlanTier.PRO,
+                plan_code="RESEARCH.ULTRA_MAX",
+                device_fingerprint=self.device_fp,
+                issued_at_utc=1_700_000_000,
+                expires_at_utc=1_700_000_000 + 30 * 86400,
+                sequence_number=10,
+                kyc_identity_hash=valid_kyc,
+                biometric_3d_mesh_hash=valid_mesh,
+                is_offline_trial=True,
+            ),
+            self.authority_seed32,
+        )
+        verifier = OfflineLicenseVerifier(
+            authority_public_key32=self.authority_pub32,
+            local_device_fingerprint=self.device_fp,
+        )
+        ent = verifier.evaluate_license(trial_token, current_utc=1_700_010_000, strict=True)
+        self.assertEqual(ent.plan_code, "RESEARCH.ULTRA_MAX")
+        self.assertTrue(ent.watermark_required)
+        self.assertIsNotNone(ent.watermark_digest)
+
+        # 4. Verify 100% owner reverse-traceability from leaked packet and audit log
+        wm_pkt = embed_packet_watermark(b"THUNDERHOLE-TRIAL-PACKET", ent.watermark_digest or "")
+        wm_log = embed_audit_log_watermark({"event": "trial_export"}, ent.watermark_digest or "")
+        traced_pkt = trace_leak_owner(wm_pkt, [trial_token])
+        traced_log = trace_leak_owner(wm_log, [trial_token])
+        self.assertIsNotNone(traced_pkt)
+        self.assertEqual(traced_pkt["license_id"], "TRIAL-RES-001")
+        self.assertEqual(traced_pkt["kyc_identity_hash"], valid_kyc)
+        self.assertEqual(traced_log["license_id"], "TRIAL-RES-001")
+
+        # 5. Expiration degrades safely to GENERAL.PLUS with CORE 100% active
+        expired_ent = verifier.evaluate_license(
+            trial_token, current_utc=1_700_000_000 + 31 * 86400, strict=False,
+        )
+        self.assertTrue(expired_ent.degraded_mode)
+        self.assertEqual(expired_ent.plan_code, "GENERAL.PLUS")
+        self.assertTrue(expired_ent.core_isolation_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()
+

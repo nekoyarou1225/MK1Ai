@@ -282,6 +282,72 @@ class QuorumTest(unittest.TestCase):
                 ("node-1", "node-2"),
             )
 
+    def test_two_admin_quorum_gate_enforces_distinct_signers_replay_expiry_and_restart_state(self):
+        from mk1_quorum import TwoAdminQuorumGate
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger_path = pathlib.Path(tmpdir) / "quorum_ledger.json"
+            gate = TwoAdminQuorumGate(self.trusted_keys, state_path=ledger_path)
+
+            challenge = TwoAdminQuorumGate.build_event_challenge(
+                event_id="evt-killswitch-001",
+                operation="kill_switch",
+                issued_at=1_700_000_000,
+                ttl_sec=60,
+            )
+            sig1 = TwoAdminQuorumGate.sign_event_challenge(
+                challenge, admin_id="node-1", private_key=self.private_keys["node-1"],
+            )
+            sig2 = TwoAdminQuorumGate.sign_event_challenge(
+                challenge, admin_id="node-2", private_key=self.private_keys["node-2"],
+            )
+
+            # 1. Single admin is rejected
+            with self.assertRaisesRegex(QuorumError, "Quorum = 2"):
+                gate.authorize_event(
+                    challenge, [sig1], expected_operation="kill_switch", now=1_700_000_010,
+                )
+
+            # 2. Duplicate admin (same admin twice) is rejected
+            with self.assertRaisesRegex(QuorumError, "repeats a signer"):
+                gate.authorize_event(
+                    challenge, [sig1, sig1], expected_operation="kill_switch", now=1_700_000_010,
+                )
+
+            # 3. Expired approval is rejected
+            with self.assertRaisesRegex(QuorumError, "expired"):
+                gate.authorize_event(
+                    challenge, [sig1, sig2], expected_operation="kill_switch", now=1_700_000_100,
+                )
+
+            # 4. Valid 2-admin approval succeeds
+            result = gate.authorize_event(
+                challenge, [sig1, sig2], expected_operation="kill_switch", now=1_700_000_020,
+            )
+            self.assertTrue(result["authorized"])
+            self.assertEqual(result["signers"], ("node-1", "node-2"))
+
+            # 5. Replay of the same event_id in memory is rejected
+            with self.assertRaisesRegex(QuorumError, "Replay of consumed event_id"):
+                gate.authorize_event(
+                    challenge, [sig1, sig2], expected_operation="kill_switch", now=1_700_000_025,
+                )
+
+            # 6. Across process restart, replay of consumed event_id is still rejected
+            restarted_gate = TwoAdminQuorumGate(self.trusted_keys, state_path=ledger_path)
+            with self.assertRaisesRegex(QuorumError, "Replay of consumed event_id"):
+                restarted_gate.authorize_event(
+                    challenge, [sig1, sig2], expected_operation="kill_switch", now=1_700_000_030,
+                )
+
+            # 7. Post-restart ledger tampering/inconsistency is rejected fail-closed
+            tampered = json.loads(ledger_path.read_text(encoding="utf-8"))
+            tampered["consumed_events"] = {}
+            ledger_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(QuorumError, "integrity check failed"):
+                TwoAdminQuorumGate(self.trusted_keys, state_path=ledger_path)
+
 
 if __name__ == "__main__":
     unittest.main()
+

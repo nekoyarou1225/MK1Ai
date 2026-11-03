@@ -186,6 +186,170 @@ class PlanTier(str, Enum):
     DEVELOPER_GROUP = "developer_group"
 
 
+class LicenseCategory(str, Enum):
+    GENERAL = "GENERAL"
+    BUSINESS = "BUSINESS"
+    RESEARCH = "RESEARCH"
+    GENESIS_GROUP = "GENESIS_GROUP"
+
+
+class LicenseSubTier(str, Enum):
+    PLUS = "PLUS"
+    PLUS_PRO = "PLUS_PRO"
+    PLUS_PRO_MAX = "PLUS_PRO_MAX"
+    PRO = "PRO"
+    PRO_MAX = "PRO_MAX"
+    ULTRA = "ULTRA"
+    ULTRA_PRO = "ULTRA_PRO"
+    ULTRA_MAX = "ULTRA_MAX"
+
+
+import re as _re
+
+_SHA256_HEX_RE = _re.compile(r"^[0-9a-fA-F]{64}$")
+_MY_NUMBER_12DIGIT_RE = _re.compile(r"(?<!\d)\d{12}(?!\d)")
+_RAW_IMAGE_MARKERS = (
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"GIF87a",
+    b"GIF89a",
+    b"BM",
+    b"data:image/",
+)
+
+
+def validate_kyc_biometric_hashes(
+    *,
+    kyc_identity_hash: str | bytes,
+    biometric_3d_mesh_hash: str | bytes,
+    device_fingerprint: str | bytes,
+) -> dict[str, str]:
+    """Validate that KYC identity, 3D facial mesh, and device fingerprint are irreversible SHA-256 hashes.
+
+    Strictly rejects raw facial images, base64 image URIs, or 12-digit My Number strings.
+    """
+    validated: dict[str, str] = {}
+    for field_name, raw_val in (
+        ("kyc_identity_hash", kyc_identity_hash),
+        ("biometric_3d_mesh_hash", biometric_3d_mesh_hash),
+        ("device_fingerprint", device_fingerprint),
+    ):
+        if isinstance(raw_val, (bytes, bytearray)):
+            for marker in _RAW_IMAGE_MARKERS:
+                if bytes(raw_val).startswith(marker) or marker in bytes(raw_val)[:64]:
+                    raise LicenseVerificationError(
+                        f"FAIL_CLOSED_BLOCK: Raw image binary prohibited in {field_name}"
+                    )
+            try:
+                text_val = bytes(raw_val).decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise LicenseVerificationError(
+                    f"FAIL_CLOSED_BLOCK: Non-ASCII binary blob prohibited in {field_name}"
+                ) from exc
+        elif isinstance(raw_val, str):
+            text_val = raw_val.strip()
+        else:
+            raise LicenseVerificationError(f"FAIL_CLOSED_BLOCK: Invalid type for {field_name}")
+
+        if text_val.lower().startswith("data:image/"):
+            raise LicenseVerificationError(
+                f"FAIL_CLOSED_BLOCK: Raw image data URI prohibited in {field_name}"
+            )
+        if len(text_val) == 12 and text_val.isdigit():
+            raise LicenseVerificationError(
+                f"FAIL_CLOSED_BLOCK: Raw 12-digit My Number string prohibited in {field_name}"
+            )
+        if not _SHA256_HEX_RE.fullmatch(text_val):
+            if _MY_NUMBER_12DIGIT_RE.search(text_val):
+                raise LicenseVerificationError(
+                    f"FAIL_CLOSED_BLOCK: Unhashed 12-digit My Number pattern prohibited in {field_name}"
+                )
+            raise LicenseVerificationError(
+                f"FAIL_CLOSED_BLOCK: {field_name} must be an irreversible 64-hex SHA-256 digest"
+            )
+        validated[field_name] = text_val.lower()
+    return validated
+
+
+def compute_watermark_digest(
+    *,
+    license_id: str,
+    kyc_identity_hash: str,
+    biometric_3d_mesh_hash: str,
+    device_fingerprint: str,
+) -> str:
+    """Compute deterministic cryptographic watermark digest for 30-day trial leak attribution."""
+    checked = validate_kyc_biometric_hashes(
+        kyc_identity_hash=kyc_identity_hash,
+        biometric_3d_mesh_hash=biometric_3d_mesh_hash,
+        device_fingerprint=device_fingerprint,
+    )
+    payload = (
+        f"MK1AI-WATERMARK-v1|{license_id.strip()}|"
+        f"{checked['kyc_identity_hash']}|"
+        f"{checked['biometric_3d_mesh_hash']}|"
+        f"{checked['device_fingerprint']}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def embed_packet_watermark(packet_bytes: bytes, watermark_digest: str) -> bytes:
+    """Embed cryptographic trial watermark into an outbound packet trailer."""
+    if not _SHA256_HEX_RE.fullmatch(watermark_digest):
+        raise LicenseVerificationError("watermark_digest must be a 64-hex SHA-256 digest")
+    tag = f"|MK1WM:{watermark_digest.lower()}|".encode("ascii")
+    return bytes(packet_bytes) + tag
+
+
+def embed_audit_log_watermark(audit_record: dict[str, Any], watermark_digest: str) -> dict[str, Any]:
+    """Embed cryptographic trial watermark into an audit log entry."""
+    if not _SHA256_HEX_RE.fullmatch(watermark_digest):
+        raise LicenseVerificationError("watermark_digest must be a 64-hex SHA-256 digest")
+    enriched = dict(audit_record)
+    enriched["watermark_digest"] = watermark_digest.lower()
+    return enriched
+
+
+def trace_leak_owner(
+    leaked_artifact: bytes | str | dict[str, Any],
+    issued_tokens: list[SignedLicenseToken],
+) -> dict[str, Any] | None:
+    """Reverse-trace a leaked packet or audit log to the exact licensed trial owner."""
+    extracted_digest: str | None = None
+    if isinstance(leaked_artifact, dict):
+        wm = leaked_artifact.get("watermark_digest")
+        if isinstance(wm, str) and _SHA256_HEX_RE.fullmatch(wm):
+            extracted_digest = wm.lower()
+    else:
+        text = (
+            leaked_artifact.decode("utf-8", errors="ignore")
+            if isinstance(leaked_artifact, (bytes, bytearray))
+            else str(leaked_artifact)
+        )
+        match = _re.search(r"MK1WM:([0-9a-fA-F]{64})", text)
+        if match:
+            extracted_digest = match.group(1).lower()
+        elif _SHA256_HEX_RE.fullmatch(text.strip()):
+            extracted_digest = text.strip().lower()
+
+    if not extracted_digest:
+        return None
+
+    for token in issued_tokens:
+        token_wm = token.effective_watermark_digest()
+        if token_wm and hmac.compare_digest(token_wm.lower(), extracted_digest):
+            return {
+                "license_id": token.license_id,
+                "customer_org": token.customer_org,
+                "plan_code": token.plan_code,
+                "kyc_identity_hash": token.kyc_identity_hash,
+                "biometric_3d_mesh_hash": token.biometric_3d_mesh_hash,
+                "device_fingerprint": token.device_fingerprint,
+                "watermark_digest": token_wm.lower(),
+            }
+    return None
+
+
 @dataclass(frozen=True)
 class PlanEntitlements:
     """Entitlements for a license tier. Core protection flags are unconditionally True."""
@@ -201,6 +365,11 @@ class PlanEntitlements:
     max_concurrent_sessions: int
     degraded_mode: bool = False
     degraded_reason: str | None = None
+    plan_code: str = "GENERAL.PLUS"
+    category: LicenseCategory = LicenseCategory.GENERAL
+    sub_tier: LicenseSubTier = LicenseSubTier.PLUS
+    watermark_required: bool = False
+    watermark_digest: str | None = None
     # Non-negotiable security invariants across all tiers and degraded states:
     core_isolation_enabled: bool = True
     attack_detection_enabled: bool = True
@@ -230,6 +399,9 @@ TIER_CATALOG: dict[PlanTier, PlanEntitlements] = {
         bandwidth_mbps=100,
         pps_limit=20_000,
         max_concurrent_sessions=1_024,
+        plan_code="GENERAL.PLUS",
+        category=LicenseCategory.GENERAL,
+        sub_tier=LicenseSubTier.PLUS,
     ),
     PlanTier.STANDARD: PlanEntitlements(
         tier=PlanTier.STANDARD,
@@ -241,6 +413,9 @@ TIER_CATALOG: dict[PlanTier, PlanEntitlements] = {
         bandwidth_mbps=1_000,
         pps_limit=150_000,
         max_concurrent_sessions=8_192,
+        plan_code="GENERAL.PRO",
+        category=LicenseCategory.GENERAL,
+        sub_tier=LicenseSubTier.PRO,
     ),
     PlanTier.PRO: PlanEntitlements(
         tier=PlanTier.PRO,
@@ -252,6 +427,9 @@ TIER_CATALOG: dict[PlanTier, PlanEntitlements] = {
         bandwidth_mbps=2_500,
         pps_limit=500_000,
         max_concurrent_sessions=32_768,
+        plan_code="BUSINESS.PRO_MAX",
+        category=LicenseCategory.BUSINESS,
+        sub_tier=LicenseSubTier.PRO_MAX,
     ),
     PlanTier.DEVELOPER_GROUP: PlanEntitlements(
         tier=PlanTier.DEVELOPER_GROUP,
@@ -263,8 +441,66 @@ TIER_CATALOG: dict[PlanTier, PlanEntitlements] = {
         bandwidth_mbps=10_000,
         pps_limit=2_000_000,
         max_concurrent_sessions=131_072,
+        plan_code="GENESIS_GROUP.ULTRA_MAX",
+        category=LicenseCategory.GENESIS_GROUP,
+        sub_tier=LicenseSubTier.ULTRA_MAX,
     ),
 }
+
+
+def _build_thunderhole_32_plan_catalog() -> dict[str, PlanEntitlements]:
+    """Construct all 32 THUNDERHOLE plans (4 categories x 8 sub-tiers)."""
+    catalog: dict[str, PlanEntitlements] = {}
+    sub_tier_order = list(LicenseSubTier)
+    for cat in LicenseCategory:
+        for idx, sub in enumerate(sub_tier_order):
+            plan_code = f"{cat.value}.{sub.value}"
+            if idx == 0 and cat == LicenseCategory.GENERAL:
+                legacy_tier = PlanTier.COMMUNITY_BASIC
+            elif idx <= 2:
+                legacy_tier = PlanTier.STANDARD
+            elif cat == LicenseCategory.GENESIS_GROUP or idx >= 6:
+                legacy_tier = PlanTier.DEVELOPER_GROUP if cat == LicenseCategory.GENESIS_GROUP else PlanTier.PRO
+            else:
+                legacy_tier = PlanTier.PRO
+
+            max_hp = min(8, max(1, idx + 1))
+            if cat == LicenseCategory.GENESIS_GROUP:
+                max_hp = min(8, max(4, idx + 1))
+            custom_os = idx >= 3 or cat in (LicenseCategory.RESEARCH, LicenseCategory.GENESIS_GROUP)
+            auto_rebuild = idx >= 1 or cat != LicenseCategory.GENERAL
+            dev_group_admin = cat == LicenseCategory.GENESIS_GROUP
+            os_fams = (
+                ("debian", "ubuntu-server")
+                if idx == 0 and cat == LicenseCategory.GENERAL
+                else (
+                    ("debian", "ubuntu-server", "rocky-linux", "almalinux")
+                    if not custom_os
+                    else ("debian", "ubuntu-server", "rocky-linux", "almalinux", "fedora-server", "custom-os")
+                )
+            )
+            bw_mbps = 100 * (idx + 1) * (2 if cat in (LicenseCategory.RESEARCH, LicenseCategory.GENESIS_GROUP) else 1)
+            pps = 25_000 * (idx + 1) * (2 if cat in (LicenseCategory.RESEARCH, LicenseCategory.GENESIS_GROUP) else 1)
+            sessions = 1_024 * (2**idx)
+            catalog[plan_code] = PlanEntitlements(
+                tier=legacy_tier,
+                max_honeypots=max_hp,
+                allowed_os_families=os_fams,
+                custom_os_allowed=custom_os,
+                auto_rebuild_allowed=auto_rebuild,
+                developer_group_admin_allowed=dev_group_admin,
+                bandwidth_mbps=bw_mbps,
+                pps_limit=pps,
+                max_concurrent_sessions=sessions,
+                plan_code=plan_code,
+                category=cat,
+                sub_tier=sub,
+                watermark_required=(cat == LicenseCategory.RESEARCH and sub == LicenseSubTier.ULTRA_MAX),
+            )
+    return catalog
+
+
+THUNDERHOLE_PLAN_CATALOG: dict[str, PlanEntitlements] = _build_thunderhole_32_plan_catalog()
 
 
 def compute_device_fingerprint(
@@ -292,10 +528,31 @@ class SignedLicenseToken:
     sequence_number: int
     max_honeypots_override: int | None = None
     group_id: str | None = None
+    plan_code: str | None = None
+    kyc_identity_hash: str | None = None
+    biometric_3d_mesh_hash: str | None = None
+    watermark_digest: str | None = None
+    is_offline_trial: bool = False
     signature_hex: str = ""
 
+    @property
+    def monotonic_seq(self) -> int:
+        return self.sequence_number
+
+    def effective_watermark_digest(self) -> str | None:
+        if self.watermark_digest:
+            return self.watermark_digest.lower()
+        if self.kyc_identity_hash and self.biometric_3d_mesh_hash:
+            return compute_watermark_digest(
+                license_id=self.license_id,
+                kyc_identity_hash=self.kyc_identity_hash,
+                biometric_3d_mesh_hash=self.biometric_3d_mesh_hash,
+                device_fingerprint=self.device_fingerprint,
+            )
+        return None
+
     def canonical_bytes(self) -> bytes:
-        doc = {
+        doc: dict[str, Any] = {
             "license_id": self.license_id,
             "customer_org": self.customer_org,
             "tier": self.tier.value,
@@ -306,13 +563,45 @@ class SignedLicenseToken:
             "max_honeypots_override": self.max_honeypots_override,
             "group_id": self.group_id,
         }
+        if self.plan_code is not None:
+            doc["plan_code"] = self.plan_code
+        if self.kyc_identity_hash is not None:
+            doc["kyc_identity_hash"] = self.kyc_identity_hash.lower()
+        if self.biometric_3d_mesh_hash is not None:
+            doc["biometric_3d_mesh_hash"] = self.biometric_3d_mesh_hash.lower()
+        if self.watermark_digest is not None:
+            doc["watermark_digest"] = self.watermark_digest.lower()
+        if self.is_offline_trial:
+            doc["is_offline_trial"] = True
         return b"MK1AI-OFFLINE-LICENSE-v1:" + json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def issue_signed_license(token: SignedLicenseToken, issuer_private_seed32: bytes) -> SignedLicenseToken:
     """Authority-side helper to sign an offline license token with Ed25519."""
-    sig = ed25519_sign(issuer_private_seed32, token.canonical_bytes()).hex()
-    return SignedLicenseToken(
+    wm_digest = token.watermark_digest
+    if (
+        token.is_offline_trial
+        or token.plan_code == "RESEARCH.ULTRA_MAX"
+        or token.kyc_identity_hash is not None
+        or token.biometric_3d_mesh_hash is not None
+    ):
+        if not token.kyc_identity_hash or not token.biometric_3d_mesh_hash:
+            raise LicenseVerificationError(
+                "Offline trial / KYC-bound license requires kyc_identity_hash and biometric_3d_mesh_hash"
+            )
+        validate_kyc_biometric_hashes(
+            kyc_identity_hash=token.kyc_identity_hash,
+            biometric_3d_mesh_hash=token.biometric_3d_mesh_hash,
+            device_fingerprint=token.device_fingerprint,
+        )
+        if wm_digest is None:
+            wm_digest = compute_watermark_digest(
+                license_id=token.license_id,
+                kyc_identity_hash=token.kyc_identity_hash,
+                biometric_3d_mesh_hash=token.biometric_3d_mesh_hash,
+                device_fingerprint=token.device_fingerprint,
+            )
+    unsigned_token = SignedLicenseToken(
         license_id=token.license_id,
         customer_org=token.customer_org,
         tier=token.tier,
@@ -322,6 +611,29 @@ def issue_signed_license(token: SignedLicenseToken, issuer_private_seed32: bytes
         sequence_number=token.sequence_number,
         max_honeypots_override=token.max_honeypots_override,
         group_id=token.group_id,
+        plan_code=token.plan_code,
+        kyc_identity_hash=token.kyc_identity_hash,
+        biometric_3d_mesh_hash=token.biometric_3d_mesh_hash,
+        watermark_digest=wm_digest,
+        is_offline_trial=token.is_offline_trial,
+        signature_hex="",
+    )
+    sig = ed25519_sign(issuer_private_seed32, unsigned_token.canonical_bytes()).hex()
+    return SignedLicenseToken(
+        license_id=unsigned_token.license_id,
+        customer_org=unsigned_token.customer_org,
+        tier=unsigned_token.tier,
+        device_fingerprint=unsigned_token.device_fingerprint,
+        issued_at_utc=unsigned_token.issued_at_utc,
+        expires_at_utc=unsigned_token.expires_at_utc,
+        sequence_number=unsigned_token.sequence_number,
+        max_honeypots_override=unsigned_token.max_honeypots_override,
+        group_id=unsigned_token.group_id,
+        plan_code=unsigned_token.plan_code,
+        kyc_identity_hash=unsigned_token.kyc_identity_hash,
+        biometric_3d_mesh_hash=unsigned_token.biometric_3d_mesh_hash,
+        watermark_digest=unsigned_token.watermark_digest,
+        is_offline_trial=unsigned_token.is_offline_trial,
         signature_hex=sig,
     )
 
@@ -428,8 +740,8 @@ class OfflineLicenseVerifier:
         self._active_crl = crl
 
     def safe_degraded_entitlements(self, reason: str) -> PlanEntitlements:
-        """Return Community/Basic Safe Degraded Mode while keeping CORE security 100% active."""
-        base = TIER_CATALOG[PlanTier.COMMUNITY_BASIC]
+        """Return GENERAL.PLUS (Community/Basic) Safe Degraded Mode while keeping CORE security 100% active."""
+        base = THUNDERHOLE_PLAN_CATALOG["GENERAL.PLUS"]
         return PlanEntitlements(
             tier=PlanTier.COMMUNITY_BASIC,
             max_honeypots=base.max_honeypots,
@@ -442,6 +754,9 @@ class OfflineLicenseVerifier:
             max_concurrent_sessions=base.max_concurrent_sessions,
             degraded_mode=True,
             degraded_reason=reason,
+            plan_code="GENERAL.PLUS",
+            category=LicenseCategory.GENERAL,
+            sub_tier=LicenseSubTier.PLUS,
             core_isolation_enabled=True,
             attack_detection_enabled=True,
             emergency_kill_switch_enabled=True,
@@ -456,11 +771,37 @@ class OfflineLicenseVerifier:
         current_utc: int,
         strict: bool = False,
     ) -> PlanEntitlements:
-        """Verify license offline; return tier entitlements or transition to Safe Degraded Mode."""
+        """Verify license offline; return tier entitlements or transition to Safe Degraded Mode (GENERAL.PLUS)."""
         try:
             # Reject environment-variable privilege bypass attempts
             if os.environ.get("MK1AI_FORCE_DEV_LICENSE") or os.environ.get("MK1AI_BYPASS_LICENSE"):
                 raise LicenseVerificationError("Environment variable license override is prohibited")
+
+            if (
+                token.is_offline_trial
+                or token.plan_code == "RESEARCH.ULTRA_MAX"
+                or token.kyc_identity_hash is not None
+                or token.biometric_3d_mesh_hash is not None
+            ):
+                if not token.kyc_identity_hash or not token.biometric_3d_mesh_hash:
+                    raise LicenseVerificationError(
+                        "Offline trial license requires kyc_identity_hash and biometric_3d_mesh_hash"
+                    )
+                validate_kyc_biometric_hashes(
+                    kyc_identity_hash=token.kyc_identity_hash,
+                    biometric_3d_mesh_hash=token.biometric_3d_mesh_hash,
+                    device_fingerprint=token.device_fingerprint,
+                )
+                expected_wm = compute_watermark_digest(
+                    license_id=token.license_id,
+                    kyc_identity_hash=token.kyc_identity_hash,
+                    biometric_3d_mesh_hash=token.biometric_3d_mesh_hash,
+                    device_fingerprint=token.device_fingerprint,
+                )
+                if token.watermark_digest and not hmac.compare_digest(
+                    token.watermark_digest.lower(), expected_wm.lower()
+                ):
+                    raise LicenseVerificationError("Trial watermark_digest mismatch")
 
             try:
                 sig_bytes = bytes.fromhex(token.signature_hex)
@@ -491,7 +832,13 @@ class OfflineLicenseVerifier:
             if token.tier == PlanTier.DEVELOPER_GROUP and not token.group_id:
                 raise LicenseVerificationError("Developer Group tier requires a bound group_id")
 
-            base = TIER_CATALOG[token.tier]
+            if token.plan_code is not None:
+                if token.plan_code not in THUNDERHOLE_PLAN_CATALOG:
+                    raise LicenseVerificationError(f"Unknown THUNDERHOLE plan_code: {token.plan_code}")
+                base = THUNDERHOLE_PLAN_CATALOG[token.plan_code]
+            else:
+                base = TIER_CATALOG[token.tier]
+
             max_hp = base.max_honeypots
             if token.max_honeypots_override is not None:
                 max_hp = max(1, min(base.max_honeypots, int(token.max_honeypots_override)))
@@ -508,11 +855,17 @@ class OfflineLicenseVerifier:
                 max_concurrent_sessions=base.max_concurrent_sessions,
                 degraded_mode=False,
                 degraded_reason=None,
+                plan_code=base.plan_code,
+                category=base.category,
+                sub_tier=base.sub_tier,
+                watermark_required=base.watermark_required or token.is_offline_trial,
+                watermark_digest=token.effective_watermark_digest(),
             )
         except LicensePlatformError as exc:
             if strict:
                 raise
             return self.safe_degraded_entitlements(str(exc))
+
 
 
 class TrafficPolicer:
