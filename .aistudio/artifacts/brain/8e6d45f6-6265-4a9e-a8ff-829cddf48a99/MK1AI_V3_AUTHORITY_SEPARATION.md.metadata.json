@@ -1,0 +1,6 @@
+{
+  "summary": "MK1Ai V3 Authority Separation Report. Defines the strict boundaries between AI-driven autonomous isolation (no human gate) and operator-driven recovery (mandatory M-of-N), ensuring fail-closed security.",
+  "updatedAt": "2026-11-03T09:53:13.423994461Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

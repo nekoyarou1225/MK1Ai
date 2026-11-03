@@ -429,17 +429,33 @@ def create_quorum_challenge(
     now: int = 1_700_000_000,
     challenge_id: str = "chg-default",
 ) -> dict[str, object]:
-    """Build a canonical M-of-N operational quorum challenge document."""
+    """Build a canonical M-of-N operational quorum challenge document.
+    
+    Now adds domain-specific prefixes based on operation:
+    - ISOLATE_NETWORK -> MK1AI-ISOLATE-v1
+    - RELEASE_QUARANTINE -> MK1AI-RECOVERY-v1
+    """
     if not isinstance(operation, str) or not operation.strip():
         raise QuorumError("Quorum challenge operation must be a non-empty string")
     if required_m < 2 or total_n < required_m or total_n > MAX_APPROVALS:
         raise QuorumError("Quorum challenge threshold must satisfy 2 <= M <= N <= 3")
+    
+    # Operation-specific prefixing
+    prefix = "MK1AI-QUARANTINE-RELEASE-v1"
+    if operation == "ISOLATE_NETWORK":
+        prefix = "MK1AI-ISOLATE-v1"
+    elif "RELEASE" in operation or "RECOVERY" in operation:
+        prefix = "MK1AI-RECOVERY-v1"
+    
     issued_at = int(now)
     expires_at = issued_at + max(1, int(ttl_sec))
+    
+    # We include the prefix in the challenge to be signed to ensure domain separation
     doc: dict[str, object] = {
         "version": 1,
         "challenge_id": str(challenge_id),
         "operation": operation,
+        "prefix": prefix,
         "parameters": dict(parameters or {}),
         "required_m": int(required_m),
         "total_n": int(total_n),

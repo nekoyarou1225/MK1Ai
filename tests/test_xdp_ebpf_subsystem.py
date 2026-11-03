@@ -191,19 +191,25 @@ class TestXDPEBPFSubsystemAndRemediations(unittest.TestCase):
         self.assertEqual(verdict.action, TCAction.TC_ACT_SHOT)
         self.assertEqual(verdict.reason, VerdictReason.TC_PLAINTEXT_LEAK)
 
-    def test_p1_01_ml_kem_1024_and_768_hybrid_secure_transport(self) -> None:
-        for kem_mod in (ml_kem_1024, ml_kem_768):
-            pub, priv = kem_mod.keygen()
-            fp = "a" * 64
-            env = mk1_secure_transport.create_encrypted_request(
-                pub, {"op": "ping"}, "POST", "/v1/rsi", fp,
-            )
-            encrypted_resp = mk1_secure_transport.encrypt_server_response(
-                priv, env.kem_ciphertext, b'{"status":"ok"}', "POST", "/v1/rsi", fp,
-            )
-            plain_resp = mk1_secure_transport.decrypt_server_response(env, encrypted_resp)
-            self.assertEqual(plain_resp, b'{"status":"ok"}')
-            env.destroy()
+    def test_p1_01_ml_kem_1024_hybrid_secure_transport(self) -> None:
+        from pqcrypto.kem.ml_kem_1024 import keygen
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        pub, priv = keygen()
+        x25519_priv = X25519PrivateKey.generate()
+        x25519_pub = x25519_priv.public_key().public_bytes(
+            mk1_secure_transport.mk1_hybrid_kem.Encoding.Raw, mk1_secure_transport.mk1_hybrid_kem.PublicFormat.Raw
+        )
+        fp = "a" * 64
+        env = mk1_secure_transport.create_encrypted_request(
+            pub, {"op": "ping"}, "POST", "/v1/rsi", fp,
+            server_x25519_public_key=x25519_pub
+        )
+        encrypted_resp = mk1_secure_transport.encrypt_server_response(
+            priv, x25519_priv, env.kem_ciphertext, b'{"status":"ok"}', "POST", "/v1/rsi", fp,
+        )
+        plain_resp = mk1_secure_transport.decrypt_server_response(env, encrypted_resp)
+        self.assertEqual(plain_resp, b'{"status":"ok"}')
+        env.destroy()
 
     def test_p1_02_flow_cache_detects_modified_payload_on_second_packet(self) -> None:
         defender._FLOW_STATE_CACHE.clear()

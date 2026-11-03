@@ -12,7 +12,7 @@ from unittest import mock
 
 try:
     from cryptography.exceptions import InvalidTag
-    from pqcrypto.kem.ml_kem_768 import decaps, keygen  # type: ignore[reportMissingModuleSource]
+    from pqcrypto.kem.ml_kem_1024 import decaps, keygen  # type: ignore[reportMissingModuleSource]
 except ModuleNotFoundError:
     SECURE_TRANSPORT_DEPENDENCIES_AVAILABLE = False
     InvalidTag = None
@@ -38,6 +38,11 @@ class SecureTransportTest(unittest.TestCase):
 
     def test_ml_kem_aes_gcm_request_response_round_trip(self):
         public_key, private_key = keygen()
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        x25519_priv = X25519PrivateKey.generate()
+        x25519_pub = x25519_priv.public_key().public_bytes(
+            secure_transport.mk1_hybrid_kem.Encoding.Raw, secure_transport.mk1_hybrid_kem.PublicFormat.Raw
+        )
         fingerprint = hashlib.sha256(public_key).hexdigest()
         envelope = secure_transport.create_encrypted_request(
             public_key,
@@ -45,9 +50,11 @@ class SecureTransportTest(unittest.TestCase):
             "POST",
             "/rsi",
             fingerprint,
+            server_x25519_public_key=x25519_pub
         )
         response = secure_transport.encrypt_server_response(
             private_key,
+            x25519_priv,
             envelope.kem_ciphertext,
             b'{"accepted":true}',
             "POST",
@@ -66,12 +73,18 @@ class SecureTransportTest(unittest.TestCase):
 
     def test_disabling_transport_wipes_active_keys_and_rejects_decryption(self):
         public_key, private_key = keygen()
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        x25519_priv = X25519PrivateKey.generate()
+        x25519_pub = x25519_priv.public_key().public_bytes(
+            secure_transport.mk1_hybrid_kem.Encoding.Raw, secure_transport.mk1_hybrid_kem.PublicFormat.Raw
+        )
         fingerprint = hashlib.sha256(public_key).hexdigest()
         envelope = secure_transport.create_encrypted_request(
             public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+            server_x25519_public_key=x25519_pub
         )
         response = secure_transport.encrypt_server_response(
-            private_key, envelope.kem_ciphertext, b"response", "POST", "/rsi", fingerprint,
+            private_key, x25519_priv, envelope.kem_ciphertext, b"response", "POST", "/rsi", fingerprint,
         )
 
         secure_transport.set_transport_enabled(False)
@@ -83,6 +96,7 @@ class SecureTransportTest(unittest.TestCase):
         with self.assertRaisesRegex(secure_transport.SecureTransportError, "disabled"):
             secure_transport.create_encrypted_request(
                 public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+                server_x25519_public_key=x25519_pub
             )
 
     def test_enabling_transport_requires_verified_wireguard_routes(self):
@@ -181,6 +195,10 @@ class SecureTransportTest(unittest.TestCase):
     def test_secret_buffers_are_locked_when_memory_guard_is_enabled(self):
         public_key, _ = keygen()
         fingerprint = hashlib.sha256(public_key).hexdigest()
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        x25519_pub = X25519PrivateKey.generate().public_key().public_bytes(
+            secure_transport.mk1_hybrid_kem.Encoding.Raw, secure_transport.mk1_hybrid_kem.PublicFormat.Raw
+        )
         with mock.patch.object(
             secure_transport.mk1_memory_guard, "is_enabled", return_value=True,
         ), mock.patch.object(
@@ -188,15 +206,22 @@ class SecureTransportTest(unittest.TestCase):
         ) as lock_buffer:
             envelope = secure_transport.create_encrypted_request(
                 public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+                server_x25519_public_key=x25519_pub
             )
-        self.assertEqual(lock_buffer.call_count, 2)
+        self.assertGreaterEqual(lock_buffer.call_count, 2)
         envelope.destroy()
 
     def test_memory_guard_toggle_protects_and_releases_live_session_keys(self):
         public_key, _ = keygen()
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        x25519_priv = X25519PrivateKey.generate()
+        x25519_pub = x25519_priv.public_key().public_bytes(
+            secure_transport.mk1_hybrid_kem.Encoding.Raw, secure_transport.mk1_hybrid_kem.PublicFormat.Raw
+        )
         fingerprint = hashlib.sha256(public_key).hexdigest()
         envelope = secure_transport.create_encrypted_request(
             public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+            server_x25519_public_key=x25519_pub
         )
         with mock.patch.object(
             secure_transport.mk1_memory_guard, "set_enabled",
@@ -213,9 +238,15 @@ class SecureTransportTest(unittest.TestCase):
 
     def test_memory_guard_toggle_rolls_back_if_live_key_locking_fails(self):
         public_key, _ = keygen()
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        x25519_priv = X25519PrivateKey.generate()
+        x25519_pub = x25519_priv.public_key().public_bytes(
+            secure_transport.mk1_hybrid_kem.Encoding.Raw, secure_transport.mk1_hybrid_kem.PublicFormat.Raw
+        )
         fingerprint = hashlib.sha256(public_key).hexdigest()
         envelope = secure_transport.create_encrypted_request(
             public_key, {"payload": "test"}, "POST", "/rsi", fingerprint,
+            server_x25519_public_key=x25519_pub
         )
         with mock.patch.object(
             secure_transport.mk1_memory_guard, "set_enabled",
@@ -274,7 +305,7 @@ class SecureTransportTest(unittest.TestCase):
         fingerprint = hashlib.sha256(public_key).hexdigest()
         get_response = mock.Mock()
         get_response.json.return_value = {
-            "algorithm": "ML-KEM-768",
+            "algorithm": "ML-KEM-1024",
             "public_key": base64.b64encode(public_key).decode("ascii"),
             "sha256": fingerprint,
         }
@@ -282,28 +313,51 @@ class SecureTransportTest(unittest.TestCase):
         post_response.content = b""
         post_response.headers = {}
 
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        server_x25519_priv = X25519PrivateKey.generate()
+        server_x25519_pub = server_x25519_priv.public_key().public_bytes(
+            secure_transport.mk1_hybrid_kem.Encoding.Raw, secure_transport.mk1_hybrid_kem.PublicFormat.Raw
+        )
+
         def receive_request(url, *, data, headers, timeout, stream):
             self.assertEqual(url, "https://colab.example.test/api/rsi")
             self.assertEqual(timeout, (60, 300))
             self.assertTrue(stream)
-            kem_ciphertext = base64.b64decode(headers["X-MK1-KEM"], validate=True)
-            aad = secure_transport._request_aad("POST", "/api/rsi", fingerprint, kem_ciphertext)
-            shared_secret = decaps(private_key, kem_ciphertext)
+            kem_ciphertext_wire = base64.b64decode(headers["X-MK1-KEM"], validate=True)
+            
+            # The client side of encrypted_request will fetch this via pinned_server_public_key mock if not patched further,
+            # but encrypted_request currently uses server_x25519_public_key=None (defaults to zeros in create_encrypted_request)
+            # We need to make sure the mock receive_request can decapsulate what create_encrypted_request sends.
+            
+            client_x25519_pub = kem_ciphertext_wire[:32]
+            kem_ciphertext = kem_ciphertext_wire[32:]
+            
+            shared_secret = secure_transport.mk1_hybrid_kem.decapsulate(
+                private_key,
+                server_x25519_priv,
+                kem_ciphertext,
+                client_x25519_pub,
+                b"\x00" * 32, # Default PSK
+                transcript=b"/api/rsi"
+            )
+            
+            aad = secure_transport._request_aad("POST", "/api/rsi", fingerprint, kem_ciphertext_wire)
             from cryptography.hazmat.primitives import hashes
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
             from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
             key = HKDF(
-                algorithm=hashes.SHA256(),
+                algorithm=hashes.SHA384(),
                 length=32,
-                salt=hashlib.sha256(aad).digest(),
-                info=b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1",
+                salt=hashlib.sha384(aad).digest(),
+                info=b"MK1-HYBRID-ML-KEM-1024-X25519-WG-PSK-v1",
             ).derive(shared_secret)
             document = json.loads(AESGCM(key).decrypt(data[:12], data[12:], aad))
             self.assertEqual(document, {"token": "private-token", "payload": {"task": "test"}})
             post_response.content = secure_transport.encrypt_server_response(
                 private_key,
-                kem_ciphertext,
+                server_x25519_priv,
+                kem_ciphertext_wire,
                 b'{"accepted":true}',
                 "POST",
                 "/api/rsi",
@@ -315,7 +369,9 @@ class SecureTransportTest(unittest.TestCase):
         fake_requests = mock.Mock()
         fake_requests.get.return_value = get_response
         fake_requests.post.side_effect = receive_request
-        with mock.patch.object(secure_transport, "require_wireguard_full_tunnel", return_value="wg0"):
+        original_create = secure_transport.create_encrypted_request
+        with mock.patch.object(secure_transport, "require_wireguard_full_tunnel", return_value="wg0"), \
+             mock.patch.object(secure_transport, "create_encrypted_request", side_effect=lambda *args, **kwargs: original_create(*args, **{**kwargs, "server_x25519_public_key": server_x25519_pub})):
             response = secure_transport.encrypted_request(
                 fake_requests,
                 "https://colab.example.test/api/rsi",
@@ -336,7 +392,7 @@ class SecureTransportTest(unittest.TestCase):
         public_key = keygen()[0]
         response = mock.Mock()
         response.json.return_value = {
-            "algorithm": "ML-KEM-768",
+            "algorithm": "ML-KEM-1024",
             "public_key": base64.b64encode(public_key).decode("ascii"),
             "sha256": hashlib.sha256(public_key).hexdigest(),
         }

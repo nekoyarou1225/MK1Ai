@@ -1,0 +1,6 @@
+{
+  "summary": "MK1Ai V3 Remaining Security Risks Report. Evaluates residual risks following the V3 remediation, including hardware dependencies, AI model drift, and physical side-channel vulnerabilities.",
+  "updatedAt": "2026-11-03T09:53:48.526179796Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

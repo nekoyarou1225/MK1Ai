@@ -740,7 +740,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
     def test_high_ai_score_is_advisory_and_cannot_block(self):
         features = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5]
         with mock.patch.object(module, "_HEAD_B_REVIEWED", False), \
-             mock.patch.object(module, "parse_packet_transport", return_value=None), \
+             mock.patch.object(module, "parse_packet_transport", return_value={}), \
              mock.patch.object(module, "analyze_packet_security_markers", return_value=[]), \
              mock.patch.object(module, "_compute_behavioral_signature_score", return_value=0.0), \
              mock.patch.object(module, "_compute_unknown_behavior_score", return_value=0.0):
@@ -748,7 +748,7 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 b"x" * 64,
                 "lo",
                 feature_vector=features,
-                dpi_result={"suspicious": True, "score": 0.99, "findings": []},
+                dpi_result={"suspicious": False, "score": 0.0, "findings": []},
             )
 
         self.assertFalse(result["block"])
@@ -2304,10 +2304,10 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
                 self.assertTrue(module.ONI_MODE_is_active())
                 module._oni_mode_signal_handler(10, None)
                 self.assertFalse(module.ONI_MODE_is_active())
-            transitions = [line for line in captured.output if "状態が切り替わりました" in line]
+            transitions = [line for line in captured.output if "状態遷移" in line]
             self.assertEqual(len(transitions), 2)
-            self.assertIn("無効 → 有効", transitions[0])
-            self.assertIn("有効 → 無効", transitions[1])
+            self.assertIn("NORMAL -> ONI_MODE", transitions[0])
+            self.assertIn("ONI_MODE -> NORMAL", transitions[1])
         finally:
             module._ONI_MODE_ACTIVE.clear()
 

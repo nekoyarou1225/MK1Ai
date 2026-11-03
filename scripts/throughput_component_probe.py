@@ -28,7 +28,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from pqcrypto.kem.ml_kem_768 import CIPHERTEXT_SIZE, PUBLIC_KEY_SIZE, decaps, encaps, keygen
+from pqcrypto.kem.ml_kem_1024 import CIPHERTEXT_SIZE, PUBLIC_KEY_SIZE, decaps, encaps, keygen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -670,9 +670,9 @@ def benchmark_loopback_transport(
                 "locally generated test token checked after AEAD decryption"
                 if include_secure_pipeline else "not included"
             ),
-            "ml_kem_768_server_keypair_generation_included": False,
-            "ml_kem_768_handshake_count": pqc_handshakes,
-            "ml_kem_768_handshake_latency": (
+            "ml_kem_1024_server_keypair_generation_included": False,
+            "ml_kem_1024_handshake_count": pqc_handshakes,
+            "ml_kem_1024_handshake_latency": (
                 percentiles(handshake_durations_us)
                 if handshake_durations_us else None
             ),
@@ -893,7 +893,7 @@ def main() -> int:
             }
             for size in args.frame_sizes
         ],
-        "ml_kem_768_sequential_session_establishment": benchmark_pqc(
+        "ml_kem_1024_sequential_session_establishment": benchmark_pqc(
             args.duration_seconds,
         ),
     }

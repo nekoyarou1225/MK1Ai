@@ -1,0 +1,6 @@
+{
+  "summary": "MK1Ai V3 Safety State Machine (FSM) Formalization. Specifies the 7-state architecture (OFF, ARMING, ACTIVE, EMERGENCY, ISOLATED, RECOVERY_PENDING, RECOVERY_APPROVED) and the valid transition paths.",
+  "updatedAt": "2026-11-03T09:53:23.058441692Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

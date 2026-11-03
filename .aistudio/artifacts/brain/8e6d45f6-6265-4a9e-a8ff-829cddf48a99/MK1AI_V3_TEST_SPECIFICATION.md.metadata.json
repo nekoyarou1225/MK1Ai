@@ -1,0 +1,6 @@
+{
+  "summary": "MK1Ai V3 Test Specification. Defines the verification procedures for the new autonomous 3-head AI triggers, the 7-state safety FSM, and the M-of-N recovery gates.",
+  "updatedAt": "2026-11-03T09:54:00.570177431Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

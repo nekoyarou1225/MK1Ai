@@ -1,0 +1,6 @@
+{
+  "summary": "MK1Ai V3 Three-Head AI Autonomy Specification. Details the logic for Head A, B, and C to independently trigger autonomous isolation, ensuring no single point of failure in threat detection.",
+  "updatedAt": "2026-11-03T09:53:06.512884045Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

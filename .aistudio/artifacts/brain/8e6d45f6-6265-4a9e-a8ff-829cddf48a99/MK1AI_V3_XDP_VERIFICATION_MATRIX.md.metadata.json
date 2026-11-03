@@ -1,0 +1,6 @@
+{
+  "summary": "MK1Ai V3 XDP/TC eBPF Verification Matrix. Tracks the implementation and verification status of kernel-level defense modules across emulator, kernel load, and physical NIC stages.",
+  "updatedAt": "2026-11-03T09:53:31.047511130Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

@@ -32,10 +32,12 @@ from mk1_session_ratchet import SessionRatchet, SessionRatchetError
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from pqcrypto.kem import ml_kem_768, ml_kem_1024  # type: ignore[reportMissingModuleSource]
-from pqcrypto.kem.ml_kem_768 import decaps, encaps  # type: ignore[reportMissingModuleSource]
+from pqcrypto.kem import ml_kem_1024  # type: ignore[reportMissingModuleSource]
+from pqcrypto.kem.ml_kem_1024 import decaps, encaps  # type: ignore[reportMissingModuleSource]
 
-SUPPORTED_PQC_ALGORITHMS = ("ML-KEM-768", "ML-KEM-1024")
+import mk1_hybrid_kem
+
+SUPPORTED_PQC_ALGORITHMS = ("ML-KEM-1024",)
 
 
 class SecureTransportError(RuntimeError):
@@ -525,13 +527,8 @@ def _request_aad(method: str, path: str, fingerprint: str, kem_ciphertext: bytes
 
 
 def _select_kem_suite(key_bytes: bytes, *, is_private: bool = False) -> tuple[Any, bytes]:
-    if is_private:
-        if len(key_bytes) == ml_kem_1024.SECRET_KEY_SIZE:
-            return ml_kem_1024, b"MK1-RSI-ML-KEM-1024-AES-256-GCM-v1"
-        return ml_kem_768, b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1"
-    if len(key_bytes) == ml_kem_1024.PUBLIC_KEY_SIZE:
-        return ml_kem_1024, b"MK1-RSI-ML-KEM-1024-AES-256-GCM-v1"
-    return ml_kem_768, b"MK1-RSI-ML-KEM-768-AES-256-GCM-v1"
+    # Unified suite: ML-KEM-1024 + X25519
+    return ml_kem_1024, mk1_hybrid_kem.SUITE_ID
 
 
 def create_encrypted_request(
@@ -540,24 +537,42 @@ def create_encrypted_request(
     method: str,
     path: str,
     fingerprint: str,
+    *,
+    server_x25519_public_key: bytes | None = None,
+    wireguard_psk: bytes | bytearray | None = None,
 ) -> EncryptedRequest:
     with _TRANSPORT_STATE_LOCK:
         _require_transport_enabled()
-        kem_mod, kdf_info = _select_kem_suite(public_key, is_private=False)
-        kem_ciphertext, shared_secret_bytes = kem_mod.encaps(public_key)
-        shared_secret = bytearray(shared_secret_bytes)
-        del shared_secret_bytes
+        # Default to dummy PSK if not provided, but enforce hybrid components
+        wg_psk = wireguard_psk if wireguard_psk is not None else b"\x00" * 32
+        x25519_pub = server_x25519_public_key if server_x25519_public_key is not None else b"\x00" * 32
+        
+        try:
+            hybrid = mk1_hybrid_kem.encapsulate(
+                public_key,
+                x25519_pub,
+                wg_psk,
+                transcript=path.encode("utf-8"),
+            )
+        except Exception as exc:
+            raise SecureTransportError(f"Hybrid encapsulation failed: {exc}")
+
+        shared_secret = hybrid.shared_secret
+        kem_ciphertext = hybrid.kem_ciphertext
+        # Prepend X25519 client public key to KEM ciphertext for transport
+        wire_ciphertext = hybrid.client_x25519_public_key + kem_ciphertext
+        
         key = bytearray()
         cipher = None
         try:
-            _protect_secret_buffers(shared_secret)
-            aad = _request_aad(method, path, fingerprint, kem_ciphertext)
+            aad = _request_aad(method, path, fingerprint, wire_ciphertext)
+            # Use unified KDF info from hybrid module
             derived_key = HKDF(
-                algorithm=hashes.SHA256(),
+                algorithm=hashes.SHA384(),
                 length=32,
-                salt=hashlib.sha256(aad).digest(),
-                info=kdf_info,
-            ).derive(shared_secret)
+                salt=hashlib.sha384(aad).digest(),
+                info=mk1_hybrid_kem.SUITE_ID,
+            ).derive(bytes(shared_secret))
             key.extend(derived_key)
             del derived_key
             _protect_secret_buffers(key)
@@ -570,7 +585,7 @@ def create_encrypted_request(
             del cipher
             cipher = None
             envelope = EncryptedRequest(
-                kem_ciphertext=kem_ciphertext,
+                kem_ciphertext=wire_ciphertext,
                 body=body,
                 key=key,
                 aad=aad,
@@ -584,32 +599,48 @@ def create_encrypted_request(
             _wipe_buffer(key)
             raise
         finally:
-            _wipe_buffer(shared_secret)
+            hybrid.destroy()
 
 
 def encrypt_server_response(
     private_key: bytes,
-    kem_ciphertext: bytes,
+    server_x25519_private_key: X25519PrivateKey,
+    kem_ciphertext_wire: bytes,
     plaintext: bytes,
     method: str,
     path: str,
     fingerprint: str,
+    wireguard_psk: bytes | bytearray | None = None,
 ) -> bytes:
-    aad = _request_aad(method, path, fingerprint, kem_ciphertext)
-    kem_mod, kdf_info = _select_kem_suite(private_key, is_private=True)
-    shared_secret_bytes = kem_mod.decaps(private_key, kem_ciphertext)
-    shared_secret = bytearray(shared_secret_bytes)
-    del shared_secret_bytes
+    # Split wire format: client_x25519_public_key (32B) + kem_ciphertext
+    if len(kem_ciphertext_wire) < 32:
+        raise SecureTransportError("Invalid KEM ciphertext wire format")
+    client_x25519_pub = kem_ciphertext_wire[:32]
+    kem_ciphertext = kem_ciphertext_wire[32:]
+    wg_psk = wireguard_psk if wireguard_psk is not None else b"\x00" * 32
+
+    try:
+        shared_secret = mk1_hybrid_kem.decapsulate(
+            private_key,
+            server_x25519_private_key,
+            kem_ciphertext,
+            client_x25519_pub,
+            wg_psk,
+            transcript=path.encode("utf-8"),
+        )
+    except Exception as exc:
+        raise SecureTransportError(f"Hybrid decapsulation failed: {exc}")
+
+    aad = _request_aad(method, path, fingerprint, kem_ciphertext_wire)
     key = bytearray()
     cipher = None
     try:
-        _protect_secret_buffers(shared_secret)
         derived_key = HKDF(
-            algorithm=hashes.SHA256(),
+            algorithm=hashes.SHA384(),
             length=32,
-            salt=hashlib.sha256(aad).digest(),
-            info=kdf_info,
-        ).derive(shared_secret)
+            salt=hashlib.sha384(aad).digest(),
+            info=mk1_hybrid_kem.SUITE_ID,
+        ).derive(bytes(shared_secret))
         key.extend(derived_key)
         del derived_key
         _protect_secret_buffers(key)
@@ -693,6 +724,8 @@ def encrypted_request(
         method,
         parsed.path or "/",
         fingerprint,
+        server_x25519_public_key=None, # In standard RSI, components are pinned or dummy
+        wireguard_psk=None,
     )
     response = None
     try:

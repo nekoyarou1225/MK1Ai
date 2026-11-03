@@ -1,0 +1,11 @@
+{
+  "name": "mk1ai-sovereign-airgap",
+  "version": "2.6.0",
+  "description": "MK1Ai (Project Sovereign-Airgap) Security Remediation & XDP Architecture Audit Server",
+  "private": true,
+  "scripts": {
+    "dev": "python3 app.py",
+    "start": "python3 app.py"
+  },
+  "dependencies": {}
+}

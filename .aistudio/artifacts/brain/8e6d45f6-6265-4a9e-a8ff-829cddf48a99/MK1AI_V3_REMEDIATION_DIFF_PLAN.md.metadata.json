@@ -1,0 +1,6 @@
+{
+  "summary": "MK1Ai V3 Remediation Diff Plan. Outlines the precise code modifications required in airgap_ai_defender.py, mk1_quorum.py, and other modules to implement the V3 autonomous air-gap and safety state machine.",
+  "updatedAt": "2026-11-03T09:53:41.827638174Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

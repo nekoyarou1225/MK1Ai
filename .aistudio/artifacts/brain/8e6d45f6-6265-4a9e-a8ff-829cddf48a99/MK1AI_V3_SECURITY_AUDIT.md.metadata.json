@@ -1,0 +1,6 @@
+{
+  "summary": "MK1Ai V3 Security Audit Report. Analyzes the current implementation against the V3 requirements, identifying gaps in the 3-Head AI autonomy, authority separation, and the safety state machine.",
+  "updatedAt": "2026-11-03T09:52:59.277397947Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
