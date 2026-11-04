@@ -1,62 +1,24 @@
 # MK1Ai V3 Remediation Diff Plan
-## Proposed Engineering Changes for Final V3 Alignment
+## Proposed Engineering Changes for FSM Strictness and Persistence
 
-**Target Phase**: Phase 4 (Final Fixing & Verification)
-**Objective**: Resolve the 3 P1 gaps identified in the V3 Audit.
+**Target Phase**: Phase 2 (Code Remediation upon User Approval)
 
-### 1. FSM Integrity & Startup Sequence (Gap 3.1 & 3.2)
-- **Target**: `airgap_ai_defender.py:MK1SafetyStateMachine`
-- **Action**:
-    - Remove `self.OFF: {self.ACTIVE}` from the allowed transitions.
-    - Add `self.RECOVERY_APPROVED: {self.ARMING}`.
-    - Remove `self.RECOVERY_APPROVED: {self.ACTIVE}`.
-    - Update `request_recovery` to transition to `ARMING` instead of `ACTIVE`.
-- **Outcome**: Strict compliance with Success Criterion 7 and Section 2.3.
+### 1. Proposed Code Modifications (`airgap_ai_defender.py`)
 
-### 2. FSM State Persistence (Gap 3.3)
-- **Target**: `airgap_ai_defender.py:MK1SafetyStateMachine`
-- **Action**:
-    - Implement `_save_state()`: Writes JSON to `/.ai_data/fsm_state.json` with a SHA-256 integrity hash of `{state, timestamp}`.
-    - Implement `_load_state()`: Reads during `__init__`. If hash mismatch or file missing (and not first run), default to `ISOLATED` (Fail-Closed).
-    - Call `_save_state()` at the end of every `transition_to`.
-- **Outcome**: Survivability across process restarts (Requirement 2.4).
+#### 1.1 Enforce Strict FSM Startup
+- **Target**: `MK1SafetyStateMachine.__init__` (around line 461).
+- **Change**: Remove `{self.ACTIVE}` from `self._allowed_transitions[self.OFF]`.
+- **Reason**: Force all startups to pass through `ARMING` to ensure integrity checks execute.
 
-### 3. Head C Model Integrity (Gap 3.2)
-- **Target**: `airgap_ai_defender.py:AbsoluteDefenseModel` and `inspect_packet_pipeline`
-- **Action**:
-    - Implement `verify_weights_hash()`: Computes SHA-256 of all model parameters (shared + head_a).
-    - In `AbsoluteDefenseModel.forward()`, if a global `INTEGRITY_CHECK_INTERVAL` is met, perform hash check.
-    - If hash mismatch, set `score_c = 1.0` (Critical Integrity Failure).
-    - Update `inspect_packet_pipeline` to use this `score_c` to trigger isolation.
-- **Outcome**: Detection of model poisoning/tampering (Success Criterion 3).
+#### 1.2 Implement FSM State Persistence
+- **Target**: `MK1SafetyStateMachine` class.
+- **Change**: Add `_save_state()` and `_load_state()` methods storing JSON with HMAC integrity checks in `/.ai_data/fsm_state.json`.
+- **Reason**: Prevent state loss across process restarts.
 
-### 4. Code Change Summary (Proposed Diff)
+#### 1.3 Fix Recovery Transition Path
+- **Target**: `MK1SafetyStateMachine.request_recovery` (line 512).
+- **Change**: Change successful recovery target state from `ACTIVE` to `ARMING`.
+- **Reason**: Ensure re-arming and re-verification occur after quarantine release.
 
-```python
-# airgap_ai_defender.py (Conceptual Diff)
-
-# 1. Strict Matrix
-self._allowed_transitions = {
-    self.OFF: {self.ARMING},
-    self.RECOVERY_APPROVED: {self.ARMING, self.EMERGENCY},
-    ...
-}
-
-# 2. Persistence
-def _save_state(self):
-    data = {"state": self._state, "ts": time.time()}
-    data["sig"] = hmac.new(b"INTERNAL_KEY", json.dumps(data), hashlib.sha256).hexdigest()
-    write_atomic("/.ai_data/fsm_state.json", data)
-
-# 3. Head C Integrity
-def verify_weights_hash(self):
-    actual = hashlib.sha256(pickle.dumps(self.state_dict())).hexdigest()
-    if actual != EXPECTED_MODEL_HASH:
-        return 1.0 # High anomaly
-    return 0.0
-```
-
-### 5. Verification Plan
-- **Unit Test**: `test_v3_strict_fsm_startup` (Ensure `OFF->ACTIVE` fails).
-- **Unit Test**: `test_v3_fsm_persistence` (Kill process, restart, verify state is preserved).
-- **Unit Test**: `test_v3_model_tamper_detection` (Manually corrupt weight, verify Head C triggers isolation).
+### 2. Regression Risk
+- Low. All changes strengthen invariant enforcement and do not alter network interfaces or packet parsing logic.

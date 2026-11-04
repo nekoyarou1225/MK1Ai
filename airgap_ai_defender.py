@@ -147,9 +147,18 @@ except Exception:  # テスト/最小環境でも import できるように軽�
             return self
 
         def item(self) -> Any:
-            if isinstance(self._value, list):
-                return self._value[0] if self._value else 0.0
-            return float(self._value)
+            cur = self._value
+            while isinstance(cur, (list, tuple)):
+                cur = cur[0] if cur else 0.0
+            return float(cur)
+
+        def __getitem__(self, idx: Any) -> "_DummyTensor":
+            if isinstance(self._value, (list, tuple)) and self._value:
+                try:
+                    return _DummyTensor(self._value[idx])
+                except Exception:
+                    return _DummyTensor(self._value[0])
+            return self
 
         def to(self, *args: Any, **kwargs: Any) -> "_DummyTensor":
             return self
@@ -451,75 +460,483 @@ class MK1SafetyStateMachine:
     RECOVERY_PENDING = "RECOVERY_PENDING"
     RECOVERY_APPROVED = "RECOVERY_APPROVED"
 
-    def __init__(self):
+    def __init__(
+        self,
+        state_path: str | None = None,
+        *,
+        journal_path: str | None = None,
+        hmac_key: bytes | str | None = None,
+        lock_timeout_sec: float = 2.0,
+        strict_dry_run_isolation: bool | None = None,
+    ):
+        self._state_path = state_path
+        self._journal_path = journal_path or (f"{state_path}.gen_journal" if state_path else None)
+        env_key = os.environ.get("MK1_FSM_HMAC_KEY")
+        raw_key = hmac_key if hmac_key is not None else (env_key if env_key else b"MK1AI-FSM-SECRET-KEY-V3")
+        self._hmac_key = raw_key.encode("utf-8") if isinstance(raw_key, str) else bytes(raw_key)
+        self._lock_timeout_sec = max(0.05, float(lock_timeout_sec))
+        self._strict_dry_run_isolation = (
+            bool(strict_dry_run_isolation)
+            if strict_dry_run_isolation is not None
+            else (state_path is not None)
+        )
         self._state = self.OFF
+        self._simulated_state = self.OFF
         self._last_transition = time.time()
-        self._lock = threading.Lock()
-        
-        # Valid transition matrix
+        self._generation = 0
+        self._max_observed_generation = 0
+        self._lock = threading.RLock()
+        self._last_recovery_approval: dict[str, Any] | None = None
+        self._last_dry_run_audit: dict[str, Any] | None = None
+        self._active_isolation_event_id: str | None = None
+        self._active_challenge_id: str | None = None
+        self._consumed_recovery_tokens: set[str] = set()
+        self._authenticity_status = "UNVERIFIED"
+        self._rollback_protection_status = "VERIFIED_JOURNAL" if self._journal_path else "UNAVAILABLE"
+        self._simulate_persistence_failure = False
+
+        # Valid transition matrix (Strict V3 compliance; EMERGENCY/ISOLATED preempts recovery)
         self._allowed_transitions = {
-            self.OFF: {self.ARMING, self.ACTIVE}, # Added ACTIVE for robust startup
+            self.OFF: {self.ARMING},
             self.ARMING: {self.OFF, self.ACTIVE, self.EMERGENCY},
             self.ACTIVE: {self.OFF, self.EMERGENCY, self.ISOLATED},
             self.EMERGENCY: {self.ISOLATED},
             self.ISOLATED: {self.RECOVERY_PENDING},
-            self.RECOVERY_PENDING: {self.ISOLATED, self.RECOVERY_APPROVED},
-            self.RECOVERY_APPROVED: {self.ACTIVE, self.EMERGENCY},
+            self.RECOVERY_PENDING: {self.ISOLATED, self.RECOVERY_APPROVED, self.EMERGENCY},
+            self.RECOVERY_APPROVED: {self.ARMING, self.EMERGENCY, self.ISOLATED},
         }
+        if self._state_path is not None:
+            self._load_persistent_state()
+
+    class _TimedLockContext:
+        def __init__(self, rlock: threading.RLock, timeout: float):
+            self._rlock = rlock
+            self._timeout = timeout
+            self._acquired = False
+
+        def __enter__(self):
+            self._acquired = self._rlock.acquire(timeout=self._timeout)
+            if not self._acquired:
+                raise TimeoutError("FSM lock acquisition timed out (potential deadlock prevented)")
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self._acquired:
+                self._rlock.release()
+            return False
+
+    def _acquire_lock(self) -> "_TimedLockContext":
+        return self._TimedLockContext(self._lock, self._lock_timeout_sec)
+
+    def _compute_integrity(self, state: str, ts: float, generation: int = 0) -> str:
+        payload = f"{state}:{ts}:{generation}".encode("utf-8")
+        return hmac.new(self._hmac_key, payload, hashlib.sha256).hexdigest()
+
+    def _compute_journal_mac(self, max_gen: int, state: str) -> str:
+        payload = f"JOURNAL:{max_gen}:{state}".encode("utf-8")
+        return hmac.new(self._hmac_key, payload, hashlib.sha256).hexdigest()
+
+    def _read_journal_max_generation(self) -> int:
+        if not self._journal_path or not os.path.isfile(self._journal_path):
+            return 0
+        try:
+            with open(self._journal_path, "r", encoding="utf-8") as jf:
+                jdata = json.load(jf)
+            max_gen = jdata.get("max_generation")
+            jstate = jdata.get("last_state")
+            jmac = jdata.get("journal_mac")
+            if (
+                isinstance(max_gen, bool)
+                or not isinstance(max_gen, int)
+                or max_gen < 0
+                or not isinstance(jstate, str)
+                or not isinstance(jmac, str)
+            ):
+                raise ValueError("Invalid journal schema")
+            expected_jmac = self._compute_journal_mac(max_gen, jstate)
+            if not hmac.compare_digest(expected_jmac, jmac):
+                raise ValueError("Journal HMAC verification failed")
+            return max_gen
+        except Exception as exc:
+            log.critical(f"[FSM] 世代ジャーナル破損検知 ({exc})。Fail-Closed を適用します。")
+            return 2**62
+
+    def _write_journal_max_generation(self, generation: int, state: str) -> bool:
+        if not self._journal_path:
+            return True
+        try:
+            parent_dir = os.path.dirname(self._journal_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            high_water = max(generation, self._max_observed_generation)
+            jdata = {
+                "max_generation": high_water,
+                "last_state": state,
+                "journal_mac": self._compute_journal_mac(high_water, state),
+            }
+            tmp_j = self._journal_path + ".tmp"
+            with open(tmp_j, "w", encoding="utf-8") as jf:
+                json.dump(jdata, jf)
+            os.replace(tmp_j, self._journal_path)
+            self._max_observed_generation = high_water
+            return True
+        except Exception as exc:
+            log.error(f"[FSM] 世代ジャーナル書き込みエラー: {exc}")
+            return False
+
+    def _save_persistent_state(self) -> bool:
+        if self._simulate_persistence_failure:
+            log.error("[FSM] シミュレーションされた永続化失敗が発生しました。")
+            return False
+        if not self._state_path:
+            return True
+        try:
+            parent_dir = os.path.dirname(self._state_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            ts = time.time()
+            sig = self._compute_integrity(self._state, ts, self._generation)
+            data = {
+                "state": self._state,
+                "timestamp": ts,
+                "generation": self._generation,
+                "consumed_tokens": sorted(self._consumed_recovery_tokens),
+                "integrity": sig,
+            }
+            tmp_path = self._state_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, self._state_path)
+            if not self._write_journal_max_generation(self._generation, self._state):
+                return False
+            self._authenticity_status = "VERIFIED"
+            return True
+        except Exception as exc:
+            log.error(f"[FSM] 状態永続化エラー: {exc}")
+            return False
+
+    def _load_persistent_state(self) -> None:
+        if not self._state_path or not os.path.isfile(self._state_path):
+            return
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or "hmac_key" in data or "secret_key" in data:
+                raise ValueError("Forbidden key material or invalid structure in FSM state file")
+            if "generation" not in data:
+                raise ValueError("Missing mandatory generation field in FSM persistent state")
+            state = data.get("state")
+            ts = data.get("timestamp")
+            gen = data.get("generation")
+            sig = data.get("integrity")
+            if (
+                not isinstance(state, str)
+                or not isinstance(ts, (int, float))
+                or isinstance(gen, bool)
+                or not isinstance(gen, int)
+                or gen < 1
+                or not isinstance(sig, str)
+            ):
+                raise ValueError("Incomplete or malformed FSM persistent state")
+            expected_sig = self._compute_integrity(state, ts, gen)
+            if not hmac.compare_digest(expected_sig, sig):
+                log.critical("[FSM] 永続状態の改竄検知！ Fail-Closed により ISOLATED に固定します。")
+                self._authenticity_status = "FAILED_HMAC"
+                self._state = self.ISOLATED
+                return
+            journal_max_gen = self._read_journal_max_generation()
+            min_required_gen = max(self._generation, self._max_observed_generation, journal_max_gen)
+            if gen < min_required_gen:
+                log.critical(
+                    f"[FSM] 永続状態の世代巻き戻し/古い正規ファイルの再投入(Rollback: {gen} < {min_required_gen})を検知！ "
+                    "Fail-Closed により ISOLATED に固定します。"
+                )
+                self._authenticity_status = "FAILED_ROLLBACK"
+                self._state = self.ISOLATED
+                return
+            if state in self._allowed_transitions:
+                self._state = state
+                self._simulated_state = state
+                self._generation = gen
+                self._max_observed_generation = max(self._max_observed_generation, gen)
+                self._last_transition = float(ts)
+                tokens = data.get("consumed_tokens", [])
+                if isinstance(tokens, list):
+                    self._consumed_recovery_tokens.update(str(t) for t in tokens)
+                self._authenticity_status = "VERIFIED"
+                log.info(f"[FSM] 永続状態を復元しました: {state} (gen={gen})")
+            else:
+                log.critical(f"[FSM] 未知の永続状態 '{state}' を検出。Fail-Closed により ISOLATED に固定します。")
+                self._authenticity_status = "FAILED_SCHEMA"
+                self._state = self.ISOLATED
+        except Exception as exc:
+            log.critical(f"[FSM] 永続状態読み込み失敗 ({exc})。Fail-Closed で ISOLATED に移行します。")
+            self._authenticity_status = "FAILED_LOAD"
+            self._state = self.ISOLATED
+
+    def get_security_status_report(self) -> dict[str, Any]:
+        with self._acquire_lock():
+            return {
+                "FSM_AUTHENTICITY": self._authenticity_status,
+                "GENERATION": self._generation,
+                "ROLLBACK_PROTECTION": self._rollback_protection_status,
+                "RECOVERY_STATUS": self._state,
+            }
 
     @property
     def current_state(self) -> str:
-        with self._lock:
+        with self._acquire_lock():
             return self._state
 
-    def transition_to(self, new_state: str, reason: str = "Policy Trigger"):
-        with self._lock:
-            if self._state == new_state:
-                return
-            
-            # Enforcement of V3 Transition Matrix
-            allowed = self._allowed_transitions.get(self._state, set())
+    @property
+    def simulated_state(self) -> str:
+        with self._acquire_lock():
+            return self._simulated_state
+
+    @property
+    def generation(self) -> int:
+        with self._acquire_lock():
+            return self._generation
+
+    @property
+    def last_recovery_approval(self) -> dict[str, Any] | None:
+        with self._acquire_lock():
+            return dict(self._last_recovery_approval) if self._last_recovery_approval else None
+
+    @property
+    def last_dry_run_audit(self) -> dict[str, Any] | None:
+        with self._acquire_lock():
+            return dict(self._last_dry_run_audit) if self._last_dry_run_audit else None
+
+    @property
+    def journal_path(self) -> str | None:
+        return self._journal_path
+
+    @property
+    def authenticity_status(self) -> str:
+        with self._acquire_lock():
+            return self._authenticity_status
+
+    def set_isolation_context(self, *, event_id: str | None = None, challenge_id: str | None = None) -> None:
+        with self._acquire_lock():
+            self._active_isolation_event_id = event_id
+            self._active_challenge_id = challenge_id
+
+    def _transition_to_locked(self, new_state: str, reason: str = "Policy Trigger", *, simulated: bool = False) -> bool:
+        if simulated:
+            base_state = self._simulated_state if self._strict_dry_run_isolation else self._state
+            if base_state == new_state:
+                return True
+            allowed = self._allowed_transitions.get(base_state, set())
             if new_state not in allowed:
-                log.error(f"[FSM] 不正な遷移試行: {self._state} -> {new_state} (理由: {reason})")
-                raise RuntimeError(f"Invalid FSM transition from {self._state} to {new_state}")
+                log.error(f"[FSM] 不正なシミュレーション遷移試行: {base_state} -> {new_state} (理由: {reason})")
+                raise RuntimeError(f"Invalid FSM transition from {base_state} to {new_state}")
+            ts = time.time()
+            self._simulated_state = new_state
+            if not self._strict_dry_run_isolation:
+                self._state = new_state
+                self._last_transition = ts
+            self._last_dry_run_audit = {
+                "simulated": True,
+                "simulation_mode": True,
+                "trigger": reason,
+                "simulated_transition": f"{base_state}->{new_state}",
+                "predicted_state": new_state,
+                "simulated_isolation": new_state == self.ISOLATED,
+                "actual_isolation_performed": False,
+                "production_state_changed": not self._strict_dry_run_isolation,
+                "production_persistence_changed": False,
+                "network_side_effects": "NONE",
+                "reason": reason,
+                "timestamp": ts,
+            }
+            return True
 
-            log.warning(f"[FSM] 状態遷移: {self._state} -> {new_state} (理由: {reason})")
-            self._state = new_state
-            self._last_transition = time.time()
-            
-            if new_state == self.EMERGENCY:
-                _ONI_MODE_ACTIVE.set()
+        if self._state == new_state:
+            return True
 
-    def request_recovery(self, approval_bundle: dict | None, challenge_document: dict | None, trusted_keys: dict[str, bytes] | None) -> bool:
+        allowed = self._allowed_transitions.get(self._state, set())
+        if new_state not in allowed:
+            log.error(f"[FSM] 不正な遷移試行: {self._state} -> {new_state} (理由: {reason})")
+            raise RuntimeError(f"Invalid FSM transition from {self._state} to {new_state}")
+
+        prev_state = self._state
+        prev_gen = self._generation
+        prev_ts = self._last_transition
+        log.warning(f"[FSM] 状態遷移: {prev_state} -> {new_state} (理由: {reason}, simulated=False)")
+        self._state = new_state
+        self._simulated_state = new_state
+        self._last_transition = time.time()
+        self._generation += 1
+        self._max_observed_generation = max(self._max_observed_generation, self._generation)
+        if not self._save_persistent_state():
+            # If persistence fails during non-isolation transition, rollback or fail-closed to ISOLATED
+            if new_state in (self.EMERGENCY, self.ISOLATED):
+                return False
+            self._state = prev_state
+            self._simulated_state = prev_state
+            self._generation = prev_gen
+            self._last_transition = prev_ts
+            raise RuntimeError(f"FSM state persistence failed during transition {prev_state} -> {new_state}")
+
+        if new_state == self.EMERGENCY:
+            _ONI_MODE_ACTIVE.set()
+        return True
+
+    def transition_to(
+        self,
+        new_state: str,
+        reason: str = "Policy Trigger",
+        *,
+        simulated: bool = False,
+        event_id: str | None = None,
+        challenge_id: str | None = None,
+    ) -> None:
+        with self._acquire_lock():
+            if not simulated:
+                if event_id is not None:
+                    self._active_isolation_event_id = event_id
+                if challenge_id is not None:
+                    self._active_challenge_id = challenge_id
+            self._transition_to_locked(new_state, reason=reason, simulated=simulated)
+
+    def isolate_immediately(
+        self,
+        reason: str = "Autonomous P0 Isolation",
+        *,
+        event_id: str | None = None,
+        challenge_id: str | None = None,
+        simulated: bool = False,
+    ) -> bool:
+        """Preempts any active or pending recovery state and locks the FSM into ISOLATED."""
+        with self._acquire_lock():
+            if not simulated:
+                if event_id is not None:
+                    self._active_isolation_event_id = event_id
+                if challenge_id is not None:
+                    self._active_challenge_id = challenge_id
+                if self._state == self.ISOLATED:
+                    return True
+                if self._state != self.EMERGENCY:
+                    if self._state in self._allowed_transitions and self.EMERGENCY in self._allowed_transitions[self._state]:
+                        self._transition_to_locked(self.EMERGENCY, reason=reason, simulated=False)
+                    else:
+                        self._state = self.EMERGENCY
+                        self._generation += 1
+                self._transition_to_locked(self.ISOLATED, reason=reason, simulated=False)
+                return self._state == self.ISOLATED
+            else:
+                target_cur = self._simulated_state if self._strict_dry_run_isolation else self._state
+                if target_cur != self.ISOLATED:
+                    if target_cur != self.EMERGENCY:
+                        self._transition_to_locked(self.EMERGENCY, reason=reason, simulated=True)
+                    self._transition_to_locked(self.ISOLATED, reason=reason, simulated=True)
+                return True
+
+    def request_recovery(
+        self,
+        approval_bundle: dict | bytes | None,
+        challenge_document: dict | None,
+        trusted_keys: dict[str, bytes] | None,
+        *,
+        expected_event_id: str | None = None,
+        expected_challenge_id: str | None = None,
+        expected_policy_version: int = 1,
+        now: int | None = None,
+    ) -> bool:
         """Mandatory M-of-N human gate for recovering from ISOLATED state."""
-        with self._lock:
+        with self._acquire_lock():
             if self._state != self.ISOLATED:
                 log.error(f"[FSM] 復旧拒否: 現在の状態 {self._state} からは復旧できません。")
                 return False
-            
+
             from mk1_quorum import verify_quorum_bundle
             try:
-                # First transition to PENDING to show intention
-                self.transition_to(self.RECOVERY_PENDING, reason="Recovery Requested")
-                
-                if verify_quorum_bundle(
+                self._transition_to_locked(self.RECOVERY_PENDING, reason="Recovery Requested")
+
+                if not isinstance(challenge_document, dict) or not approval_bundle or not trusted_keys:
+                    raise ValueError("challenge_document, approval_bundle, and trusted_keys are required")
+
+                current_ts = int(time.time()) if now is None else int(now)
+
+                # Enforce event_id and challenge_id binding (support top-level or parameters dict)
+                req_event_id = expected_event_id if expected_event_id is not None else self._active_isolation_event_id
+                req_challenge_id = expected_challenge_id if expected_challenge_id is not None else self._active_challenge_id
+                params = challenge_document.get("parameters") if isinstance(challenge_document.get("parameters"), dict) else {}
+                doc_event_id = challenge_document.get("event_id", params.get("event_id"))
+                doc_challenge_id = challenge_document.get("challenge_id", params.get("challenge_id"))
+
+                if req_event_id is not None and doc_event_id != req_event_id:
+                    raise ValueError(f"Recovery event_id mismatch: expected {req_event_id}, got {doc_event_id}")
+                if req_challenge_id is not None and doc_challenge_id != req_challenge_id:
+                    raise ValueError(f"Recovery challenge_id mismatch: expected {req_challenge_id}, got {doc_challenge_id}")
+
+                # Enforce policy version and domain prefix
+                policy_version = challenge_document.get("policy_version", params.get("policy_version", challenge_document.get("version", 1)))
+                if isinstance(policy_version, bool) or policy_version != expected_policy_version:
+                    raise ValueError(f"Unsupported recovery policy_version: {policy_version}")
+                prefix = challenge_document.get("prefix")
+                if prefix is not None and prefix != "MK1AI-RECOVERY-v1":
+                    raise ValueError(f"Invalid recovery domain prefix: {prefix}")
+
+                # Enforce replay protection across challenge_id, event_id, and bundle digest
+                raw_bundle = (
+                    approval_bundle
+                    if isinstance(approval_bundle, bytes)
+                    else json.dumps(dict(approval_bundle), sort_keys=True, separators=(",", ":")).encode("utf-8")
+                )
+                raw_challenge = json.dumps(dict(challenge_document), sort_keys=True, separators=(",", ":")).encode("utf-8")
+                replay_token = hashlib.sha256(raw_challenge + b"|" + raw_bundle).hexdigest()
+                if (
+                    replay_token in self._consumed_recovery_tokens
+                    or (isinstance(doc_challenge_id, str) and f"chg:{doc_challenge_id}" in self._consumed_recovery_tokens)
+                    or (isinstance(doc_event_id, str) and f"evt:{doc_event_id}" in self._consumed_recovery_tokens)
+                ):
+                    raise ValueError("Replay of consumed recovery approval rejected")
+
+                verification = verify_quorum_bundle(
                     approval_bundle,
                     challenge_document=challenge_document,
                     trusted_keys=trusted_keys,
-                    expected_operation="RELEASE_QUARANTINE"
-                ):
-                    self.transition_to(self.RECOVERY_APPROVED, reason="M-of-N Met")
-                    self.transition_to(self.ACTIVE, reason="Restoration Complete")
-                    log.warning("[FSM] システムが正常状態（ACTIVE）に復旧しました。")
-                    return True
-                else:
-                    log.error("[FSM] 復旧承認に失敗しました。")
-                    return False
+                    expected_operation="RELEASE_QUARANTINE",
+                    now=current_ts,
+                )
+                signers = list(verification.get("signers", ())) if isinstance(verification, dict) else []
+                if not (verification and verification.get("verified") and len(set(signers)) >= 2):
+                    raise ValueError("Quorum verification did not return at least 2 distinct verified signers")
+
+                # Record consumed tokens before state completion
+                self._consumed_recovery_tokens.add(replay_token)
+                if isinstance(doc_challenge_id, str) and doc_challenge_id:
+                    self._consumed_recovery_tokens.add(f"chg:{doc_challenge_id}")
+                if isinstance(doc_event_id, str) and doc_event_id:
+                    self._consumed_recovery_tokens.add(f"evt:{doc_event_id}")
+
+                self._transition_to_locked(self.RECOVERY_APPROVED, reason="M-of-N Met")
+                self._last_recovery_approval = {
+                    "verified": True,
+                    "signature_verification": "VERIFIED",
+                    "operation": "RELEASE_QUARANTINE",
+                    "signers": signers,
+                    "challenge_id": doc_challenge_id,
+                    "event_id": doc_event_id,
+                    "issued_at": challenge_document.get("issued_at"),
+                    "expires_at": challenge_document.get("expires_at"),
+                    "policy_version": policy_version,
+                    "generation": self._generation,
+                    "approved_at": current_ts,
+                }
+                self._transition_to_locked(self.ARMING, reason="System Re-Arming After Recovery")
+                self._transition_to_locked(self.ACTIVE, reason="Restoration Complete")
+                self._active_isolation_event_id = None
+                self._active_challenge_id = None
+                log.warning("[FSM] システムが正常状態（ACTIVE）に復旧しました。")
+                return True
             except Exception as exc:
                 log.error(f"[FSM] 復旧処理エラー: {exc}")
-                # Rollback to ISOLATED if anything fails during PENDING
-                if self._state == self.RECOVERY_PENDING:
-                    self._state = self.ISOLATED
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                self._save_persistent_state()
                 return False
 
 _SAFETY_FSM = MK1SafetyStateMachine()
@@ -529,7 +946,7 @@ if str(os.environ.get("ONI_MODE", "")).lower() in {"1", "true", "yes", "on"}:
     _SAFETY_FSM.transition_to(MK1SafetyStateMachine.ACTIVE, reason="Environment Variable")
     _ONI_MODE_ACTIVE.set()
 else:
-    # Default to ACTIVE if not specified, assuming successful startup sequence
+    # Default to ACTIVE via strict OFF -> ARMING -> ACTIVE startup sequence
     try:
         _SAFETY_FSM.transition_to(MK1SafetyStateMachine.ARMING, reason="Startup")
         _SAFETY_FSM.transition_to(MK1SafetyStateMachine.ACTIVE, reason="Startup Complete")
@@ -4700,17 +5117,127 @@ class LightweightMultiTaskAI(nn.Module):
         self._ewc_optima: dict = {}   # パラメータ名 → 基準パラメータ値 (クラウド学習時)
         self._ewc_lambda = 100.0      # EWC 正則化強度 (大きいほど旧知識を保護)
 
-        # Head C (司令塔): データをストレージに逃がすべき緊急度を予測
-        # スコアが高い = 「今すぐRAMのデータをストレージに移せ！」
+        # Head C (司令塔 / メモリ完全性監視): データをストレージに逃がすべき緊急度 + 重み改竄検知
+        # スコアが高い = 「今すぐRAM退避 / メモリ完全性侵害の検知」
         # ヒステリシス: ON閾値=0.75 / OFF閾値=0.50 でチャタリング防止
         self.head_c = nn.Sequential(nn.Linear(16, 1), nn.Sigmoid())
+        self._weights_integrity_hash: str | None = None
+        self._tamper_injected: bool = False
+        self._require_baseline: bool = False
+        self._weight_buffers: dict[str, bytes] = {
+            "shared_layer.0.weight": b"\x01\x02\x03\x04" * 16,
+            "head_a.0.weight": b"\x05\x06\x07\x08" * 8,
+            "head_b.0.weight": b"\x09\x0a\x0b\x0c" * 4,
+            "head_c.0.weight": b"\x0d\x0e\x0f\x10" * 4,
+        }
+
+    def compute_weights_hash(self) -> str:
+        """Compute deterministic SHA-256 digest over all sorted model parameters, shapes, dtypes, and buffers."""
+        hasher = hashlib.sha256(b"MK1AI-MODEL-WEIGHTS-V3:")
+        params = list(self.named_parameters())
+        if params:
+            for name, param in sorted(params, key=lambda kv: kv[0]):
+                shape_str = str(tuple(getattr(param, "shape", ())))
+                dtype_str = str(getattr(param, "dtype", "float32"))
+                hasher.update(f"{name}|{shape_str}|{dtype_str}|".encode("utf-8"))
+                try:
+                    if hasattr(param, "detach"):
+                        vals = param.detach().reshape(-1).tolist()
+                    elif hasattr(param, "tolist"):
+                        vals = param.tolist()
+                    else:
+                        vals = [0.0]
+                    for v in vals:
+                        fval = float(v)
+                        if not math.isfinite(fval):
+                            return "CORRUPTED_NON_FINITE"
+                        hasher.update(struct.pack("!d", fval))
+                except Exception:
+                    return "CORRUPTED_EXCEPTION"
+        if not self._weight_buffers or len(self._weight_buffers) < 4:
+            return "CORRUPTED_MISSING_WEIGHTS"
+        for bname, bbytes in sorted(self._weight_buffers.items(), key=lambda kv: kv[0]):
+            if not isinstance(bbytes, (bytes, bytearray)) or len(bbytes) == 0:
+                return "CORRUPTED_MISSING_WEIGHTS"
+            hasher.update(f"buf:{bname}:{len(bbytes)}:".encode("utf-8"))
+            hasher.update(bytes(bbytes))
+        return hasher.hexdigest()
+
+    def record_weights_integrity_baseline(self, *, require_baseline: bool = True) -> str:
+        """Record the trusted baseline hash of model weights for Head C verification."""
+        digest = self.compute_weights_hash()
+        if digest.startswith("CORRUPTED_"):
+            raise ValueError(f"Cannot record baseline from corrupted model weights: {digest}")
+        self._weights_integrity_hash = digest
+        self._tamper_injected = False
+        self._require_baseline = bool(require_baseline)
+        return self._weights_integrity_hash
+
+    def create_signed_weights_manifest(self, secret_key: bytes | str) -> dict[str, Any]:
+        """Create an HMAC-SHA256 signed manifest protecting the model baseline hash."""
+        key_bytes = secret_key.encode("utf-8") if isinstance(secret_key, str) else bytes(secret_key)
+        weights_hash = self.compute_weights_hash()
+        if weights_hash.startswith("CORRUPTED_"):
+            raise ValueError("Cannot sign manifest for corrupted weights")
+        manifest_body = {
+            "version": 1,
+            "model_class": self.__class__.__name__,
+            "weights_sha256": weights_hash,
+        }
+        canonical = json.dumps(manifest_body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        sig = hmac.new(key_bytes, b"MK1AI-MANIFEST-V3:" + canonical, hashlib.sha256).hexdigest()
+        return {**manifest_body, "signature": sig}
+
+    def verify_signed_weights_manifest(self, manifest: dict[str, Any], secret_key: bytes | str) -> bool:
+        """Verify signed manifest authenticity and match against current in-memory model weights."""
+        if not isinstance(manifest, dict):
+            return False
+        key_bytes = secret_key.encode("utf-8") if isinstance(secret_key, str) else bytes(secret_key)
+        provided_sig = manifest.get("signature")
+        weights_sha256 = manifest.get("weights_sha256")
+        if not isinstance(provided_sig, str) or not isinstance(weights_sha256, str):
+            return False
+        manifest_body = {
+            "version": manifest.get("version"),
+            "model_class": manifest.get("model_class"),
+            "weights_sha256": weights_sha256,
+        }
+        canonical = json.dumps(manifest_body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        expected_sig = hmac.new(key_bytes, b"MK1AI-MANIFEST-V3:" + canonical, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_sig, provided_sig):
+            return False
+        current_hash = self.compute_weights_hash()
+        if current_hash.startswith("CORRUPTED_") or not hmac.compare_digest(current_hash, weights_sha256):
+            return False
+        self._weights_integrity_hash = weights_sha256
+        self._require_baseline = True
+        return True
+
+    def verify_weights_integrity(self, *, require_baseline: bool | None = None) -> bool:
+        """Verify model weights against baseline hash and check for NaN/Inf or 1-byte corruption."""
+        if self._tamper_injected:
+            return False
+        must_have_baseline = self._require_baseline if require_baseline is None else bool(require_baseline)
+        if must_have_baseline and self._weights_integrity_hash is None:
+            return False
+        current_hash = self.compute_weights_hash()
+        if current_hash.startswith("CORRUPTED_"):
+            return False
+        if self._weights_integrity_hash is not None and not hmac.compare_digest(current_hash, self._weights_integrity_hash):
+            return False
+        return True
 
     def forward(self, x):
         shared = self.shared_layer(x)
+        out_a = self.head_a(shared)
+        out_b = self.head_b(shared)
+        out_c = self.head_c(shared)
+        if not self.verify_weights_integrity():
+            out_c = torch.tensor([[1.0]], dtype=torch.float32)
         # Head A: Threat Score (0-1)
         # Head B: Sequential Prediction / Benign Probability (0-1)
-        # Head C: Memory Integrity Anomaly (0-1)
-        return self.head_a(shared), self.head_b(shared), self.head_c(shared)
+        # Head C: Memory Integrity Anomaly / Eviction Urgency (0-1)
+        return out_a, out_b, out_c
 
     def store_ewc_checkpoint(self):
         """クラウド学習済みモデルをロード直後に呼び出し、EWC の基準点を記録する。"""
@@ -5747,82 +6274,115 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                           *, approval_bundle: dict | None = None,
                           challenge_document: dict | None = None,
                           trusted_keys: dict[str, bytes] | None = None,
-                          autonomous: bool = False) -> bool:
+                          autonomous: bool = False,
+                          fsm: MK1SafetyStateMachine | None = None) -> bool:
     """Threats are advisory; active isolation requires verified per-event operator approval, 
     unless 'autonomous=True' and high-confidence P0 threat is detected in any of the 3 heads.
     """
     global _ISOLATION_APPROVAL_PENDING, _LAST_KILL_SWITCH_TRIGGER
     global _anomaly_counter, _LAST_THREAT_SCORE
-    _LAST_THREAT_SCORE = max(0.0, min(0.99, float(score_a)))
 
-    if is_learning_mode() and (backdoor_detected or backdoor_boost > 0.0 or score_a >= 0.95 or score_b >= 0.95):
-        _report_learning_detection(f"脅威スコア (A: {score_a:.3f}, B: {score_b:.3f}) を検出")
+    target_fsm = fsm if fsm is not None else _SAFETY_FSM
+    effective_dry_run = dry_run or is_learning_mode()
+
+    # V3 Independent 3-Head Evaluation with Fail-Closed NaN/Inf/Out-of-Range protection
+    corrupted_scores = False
+    for raw_s in (score_a, score_b, score_c):
+        if (
+            raw_s is None
+            or isinstance(raw_s, bool)
+            or not isinstance(raw_s, (int, float))
+            or not math.isfinite(float(raw_s))
+            or float(raw_s) < 0.0
+            or float(raw_s) > 1.0
+        ):
+            corrupted_scores = True
+            break
+
+    safe_score_a = 1.0 if corrupted_scores else float(score_a)
+    safe_score_b = 1.0 if corrupted_scores else float(score_b)
+    safe_score_c = 1.0 if corrupted_scores else float(score_c)
+
+    if not effective_dry_run:
+        _LAST_THREAT_SCORE = max(0.0, min(0.99, safe_score_a))
+
+    if is_learning_mode() and (backdoor_detected or backdoor_boost > 0.0 or safe_score_a >= 0.95 or safe_score_b >= 0.95):
+        _report_learning_detection(f"脅威スコア (A: {safe_score_a:.3f}, B: {safe_score_b:.3f}) を検出")
         return False
 
-    effective_dry_run = dry_run or is_learning_mode()
     now = time.time()
     with _CONTAINMENT_LOCK:
-        if _KILL_SWITCH_TRIGGERED and now - _LAST_KILL_SWITCH_TRIGGER < _KILL_SWITCH_COOLDOWN_SEC:
+        if not effective_dry_run and _KILL_SWITCH_TRIGGERED and now - _LAST_KILL_SWITCH_TRIGGER < _KILL_SWITCH_COOLDOWN_SEC:
             return False
 
-        # V3 Independent 3-Head Evaluation
-        effective_score_a = score_a
-        if backdoor_boost > 0.0:
-            effective_score_a = max(effective_score_a, min(0.99, effective_score_a + backdoor_boost))
-        if backdoor_detected:
+        effective_score_a = safe_score_a
+        if backdoor_boost > 0.0 and math.isfinite(float(backdoor_boost)):
+            effective_score_a = max(effective_score_a, min(0.99, effective_score_a + float(backdoor_boost)))
+        if backdoor_detected or corrupted_scores:
             effective_score_a = max(effective_score_a, 0.99)
 
-        # Anomaly counter decay logic (Head A driven)
-        last_decay_at, decayed = _apply_anomaly_decay(now)
-        if effective_score_a >= 0.95:
-            if _anomaly_counter > 0 and not decayed and now - last_decay_at < _ANOMALY_DECAY_WINDOW_SEC:
-                _anomaly_counter += 1
+        # Anomaly counter decay logic (Head A driven; do not pollute production counter in dry_run)
+        if not effective_dry_run:
+            last_decay_at, decayed = _apply_anomaly_decay(now)
+            if effective_score_a >= 0.95:
+                if _anomaly_counter > 0 and not decayed and now - last_decay_at < _ANOMALY_DECAY_WINDOW_SEC:
+                    _anomaly_counter += 1
+                else:
+                    _anomaly_counter = 1
             else:
-                _anomaly_counter = 1
+                _anomaly_counter = max(0, _anomaly_counter - 1)
+            active_anomaly_count = _anomaly_counter
         else:
-            _anomaly_counter = max(0, _anomaly_counter - 1)
+            active_anomaly_count = _anomaly_counter + (1 if effective_score_a >= 0.95 else 0)
 
-        # Autonomous isolation trigger: P0 threat detection in ANY head
-        is_p0_a = backdoor_detected or _anomaly_counter >= 3 or effective_score_a >= 0.99
-        is_p0_b = score_b >= 0.98
-        is_p0_c = score_c >= 0.95
+        # Autonomous isolation trigger: P0 threat detection in ANY head (independent, no majority required)
+        is_p0_a = backdoor_detected or corrupted_scores or active_anomaly_count >= 3 or effective_score_a >= 0.99
+        is_p0_b = safe_score_b >= 0.98
+        is_p0_c = safe_score_c >= 0.95
         
         should_trigger = is_p0_a or is_p0_b or is_p0_c
         
         if should_trigger:
             trigger_reasons = []
-            if is_p0_a: trigger_reasons.append(f"Head A (Current/Backdoor)")
-            if is_p0_b: trigger_reasons.append(f"Head B (Predictive: {score_b:.3f})")
-            if is_p0_c: trigger_reasons.append(f"Head C (Memory Integrity: {score_c:.3f})")
+            if corrupted_scores:
+                trigger_reasons.append("Corrupted/Non-Finite AI Score (Fail-Closed)")
+            if is_p0_a:
+                trigger_reasons.append(f"Head A (Current/Backdoor: {effective_score_a:.3f})")
+            if is_p0_b:
+                trigger_reasons.append(f"Head B (Predictive: {safe_score_b:.3f})")
+            if is_p0_c:
+                trigger_reasons.append(f"Head C (Memory Integrity: {safe_score_c:.3f})")
 
-            if effective_dry_run:
-                log.warning("[MAINTENANCE] 脅威検知しましたが、メンテナンス状態のため Dry-Run とします。")
-            
-            _KILL_SWITCH_EVENT.set()
-            _LAST_KILL_SWITCH_TRIGGER = now
             management_route = _configured_management_route()
 
             if effective_dry_run:
+                log.warning("[MAINTENANCE] 脅威検知しましたが、メンテナンス状態またはDry-Runのため実遮断は行いません。")
                 log.info(
                     "脅威イベントを検出しました。Dry-Runのため実遮断は行いません "
                     "(reasons: %s)", ", ".join(trigger_reasons)
                 )
                 if autonomous:
-                    _SAFETY_FSM.transition_to(MK1SafetyStateMachine.EMERGENCY, reason="Autonomous P0 Detection (Simulated)")
+                    target_fsm.isolate_immediately(
+                        reason="Autonomous P0 Detection (Simulated)",
+                        simulated=True,
+                    )
                     if not _dispatch_privileged_command(
                         "kill_switch", interface=interface, dry_run=True, **management_route,
                     ):
                         execute_kill_switch(interface, True, **management_route)
-                    _SAFETY_FSM.transition_to(MK1SafetyStateMachine.ISOLATED, reason="Isolation Complete (Simulated)")
                 else:
-                    _ISOLATION_APPROVAL_PENDING = True
+                    if not target_fsm._strict_dry_run_isolation:
+                        _ISOLATION_APPROVAL_PENDING = True
                     log.warning("[ISOLATION] 脅威を検知(Dry-Run)。本来であれば管理者承認待ちとなります。")
                 return True
+
+            _KILL_SWITCH_EVENT.set()
+            _LAST_KILL_SWITCH_TRIGGER = now
 
             # Autonomous Path: Bypass M-of-N if autonomous=True and confidence is P0 high
             if autonomous:
                 log.warning(f"[AUTONOMOUS_DEFENSE] P0脅威を検出し、自律隔離を開始します。理由: {', '.join(trigger_reasons)}")
-                _SAFETY_FSM.transition_to(MK1SafetyStateMachine.EMERGENCY, reason="Autonomous P0 Detection")
+                target_fsm.isolate_immediately(reason="Autonomous P0 Detection")
                 
                 success = execute_kill_switch(
                     interface,
@@ -5830,9 +6390,7 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                     autonomous_bypass=True,
                     **management_route,
                 )
-                if success:
-                    _SAFETY_FSM.transition_to(MK1SafetyStateMachine.ISOLATED, reason="Isolation Complete")
-                return success
+                return bool(success or target_fsm.current_state == MK1SafetyStateMachine.ISOLATED)
 
             # Standard Quorum Path
             if verify_event_isolation_approval(
@@ -5842,7 +6400,7 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                 interface=interface,
             ):
                 _ISOLATION_APPROVAL_PENDING = False
-                _SAFETY_FSM.transition_to(MK1SafetyStateMachine.EMERGENCY, reason="Quorum Approval Received")
+                target_fsm.transition_to(MK1SafetyStateMachine.EMERGENCY, reason="Quorum Approval Received")
                 success = execute_kill_switch(
                     interface,
                     False,
@@ -5852,7 +6410,7 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                     **management_route,
                 )
                 if success:
-                    _SAFETY_FSM.transition_to(MK1SafetyStateMachine.ISOLATED, reason="Isolation Complete")
+                    target_fsm.transition_to(MK1SafetyStateMachine.ISOLATED, reason="Isolation Complete")
                 return success
             else:
                 _ISOLATION_APPROVAL_PENDING = True
@@ -5860,7 +6418,6 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                     "[ISOLATION] 脅威を検知しました。管理者承認（M-of-N）待ちのため隔離を保留中。"
                 )
             return True
-    return False
     return False
 
 
@@ -6182,52 +6739,68 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
                 "diagnostic_trace": trace,
             }
         ai_score = min(0.99, max(0.0, 0.2 + 0.15 * max(feature_vector[:3]) + 0.1 * sum(feature_vector[3:8]) + 0.1 * feature_vector[9]))
-        if model is not None:
-            # 2.3: Protected model inference
-            try:
-                with _MODEL_ACCESS_LOCK, torch.no_grad():
-                    tensor_input = torch.tensor([feature_vector], dtype=torch.float32)
-                    outputs = model(tensor_input)
-                    # Support both (sa, sb, sc) and single output if necessary, though AbsoluteDefenseModel is multi-head
-                    if isinstance(outputs, (list, tuple)) and len(outputs) >= 3:
-                        score_a, score_b, score_c = outputs[0], outputs[1], outputs[2]
-                        benign_probability = float(score_b.reshape(-1)[0].item())
-                        ai_score = max(ai_score, float(score_a.reshape(-1)[0].item()))
-                        # Export all 3 scores for V3 pipeline
-                        ai_scores = {
-                            "score_a": float(score_a.reshape(-1)[0].item()),
-                            "score_b": float(score_b.reshape(-1)[0].item()),
-                            "score_c": float(score_c.reshape(-1)[0].item()),
-                        }
-                    elif isinstance(outputs, (list, tuple)) and len(outputs) >= 2:
-                        score_a, score_b = outputs[0], outputs[1]
-                        benign_probability = float(score_b.reshape(-1)[0].item())
-                        ai_score = max(ai_score, float(score_a.reshape(-1)[0].item()))
-                        ai_scores = {"score_a": ai_score, "score_b": benign_probability, "score_c": 0.0}
-                    elif hasattr(outputs, "item"):
-                        ai_score = max(ai_score, float(outputs.item()))
-                        ai_scores = {"score_a": ai_score, "score_b": 0.0, "score_c": 0.0}
-                    else:
-                        ai_scores = {"score_a": ai_score, "score_b": 0.0, "score_c": 0.0}
-                
-                if not math.isfinite(benign_probability):
-                    benign_probability = 0.0
-                if _HEAD_B_REVIEWED:
-                    ai_score = _adjust_soft_ai_score(ai_score, benign_probability, reviewed=True)
-            except Exception as exc:
-                log.warning(f"[AI] 推論中に例外が発生しました ({exc})。安全のためフェールクローズ評価へ移行します。")
-                ai_score = max(ai_score, 0.85) # Fail-closed score boost
-                benign_probability = 0.0
-                ai_scores = {"score_a": ai_score, "score_b": 0.0, "score_c": 0.0}
-    elif model is not None:
+    if model is not None:
+        effective_fv = list(feature_vector) if feature_vector is not None else [0.0] * _ALLOWED_PACKET_FEATURE_LENGTH
+        # 2.3 & V3 5.2-5.4: Protected model inference with strict output & weight integrity validation
+        ai_integrity_failure = False
+        ai_integrity_reason = "clear"
         try:
-            with torch.no_grad():
-                score_a, _, _ = model(torch.tensor([[0.0] * 10], dtype=torch.float32))
-            ai_score = float(score_a.item()) if hasattr(score_a, "item") else 0.0
-            if not math.isfinite(ai_score):
-                ai_score = 0.0
-        except Exception:
-            ai_score = 0.0
+            with _MODEL_ACCESS_LOCK, torch.no_grad():
+                if hasattr(model, "verify_weights_integrity") and not model.verify_weights_integrity():
+                    ai_integrity_failure = True
+                    ai_integrity_reason = "model_weights_integrity_failure"
+                tensor_input = torch.tensor([effective_fv], dtype=torch.float32)
+                outputs = model(tensor_input)
+                if not isinstance(outputs, (list, tuple)) or len(outputs) < 3:
+                    ai_integrity_failure = True
+                    ai_integrity_reason = "malformed_model_output_dimensions"
+                    raw_a, raw_b, raw_c = 1.0, 1.0, 1.0
+                else:
+                    score_a_t, score_b_t, score_c_t = outputs[0], outputs[1], outputs[2]
+                    if score_a_t is None or score_b_t is None or score_c_t is None:
+                        ai_integrity_failure = True
+                        ai_integrity_reason = "null_model_head_output"
+                        raw_a, raw_b, raw_c = 1.0, 1.0, 1.0
+                    else:
+                        raw_a = float(score_a_t.reshape(-1)[0].item())
+                        raw_b = float(score_b_t.reshape(-1)[0].item())
+                        raw_c = float(score_c_t.reshape(-1)[0].item())
+                for head_val in (raw_a, raw_b, raw_c):
+                    if not math.isfinite(head_val) or head_val < 0.0 or head_val > 1.0:
+                        ai_integrity_failure = True
+                        ai_integrity_reason = "non_finite_or_out_of_range_head_output"
+                        break
+                if ai_integrity_failure:
+                    raw_a, raw_b, raw_c = 1.0, 0.0, 1.0
+                benign_probability = raw_b
+                ai_score = max(ai_score, raw_a, raw_c if raw_c >= 0.95 else 0.0)
+                ai_scores = {
+                    "score_a": raw_a,
+                    "score_b": raw_b,
+                    "score_c": raw_c,
+                }
+            if _HEAD_B_REVIEWED and not ai_integrity_failure:
+                ai_score = _adjust_soft_ai_score(ai_score, benign_probability, reviewed=True)
+        except Exception as exc:
+            log.warning(f"[AI] 推論中に例外が発生しました ({exc})。安全のためフェールクローズ評価へ移行します。")
+            ai_integrity_failure = True
+            ai_integrity_reason = f"model_inference_exception:{type(exc).__name__}"
+            ai_score = 1.0
+            benign_probability = 0.0
+            ai_scores = {"score_a": 1.0, "score_b": 0.0, "score_c": 1.0}
+
+        if ai_integrity_failure:
+            _record_security_health_issue("ai_integrity_failure", ai_integrity_reason, source_ip=None)
+            trace = build_diagnostic_trace(layer=3, threshold=0.95, score=1.0, reason=ai_integrity_reason)
+            return {
+                "block": True,
+                "stage": "ai_integrity_failure",
+                "score": 1.0,
+                "reason": ai_integrity_reason,
+                "ai_integrity_failure": True,
+                "ai_scores": ai_scores,
+                "diagnostic_trace": trace,
+            }
 
     math_score = 0.0
     if feature_vector is not None:

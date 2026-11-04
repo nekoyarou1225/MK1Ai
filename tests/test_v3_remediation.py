@@ -50,7 +50,11 @@ class TestV3Remediation(unittest.TestCase):
         fsm.transition_to(fsm.RECOVERY_APPROVED)
         self.assertEqual(fsm.current_state, fsm.RECOVERY_APPROVED)
         
-        # RECOVERY_APPROVED -> ACTIVE (Valid)
+        # RECOVERY_APPROVED -> ARMING (Valid)
+        fsm.transition_to(fsm.ARMING)
+        self.assertEqual(fsm.current_state, fsm.ARMING)
+
+        # ARMING -> ACTIVE (Valid)
         fsm.transition_to(fsm.ACTIVE)
         self.assertEqual(fsm.current_state, fsm.ACTIVE)
 
@@ -59,6 +63,8 @@ class TestV3Remediation(unittest.TestCase):
         fsm = MK1SafetyStateMachine() # OFF
         with self.assertRaises(RuntimeError):
             fsm.transition_to(fsm.ISOLATED) # OFF -> ISOLATED is invalid
+        with self.assertRaises(RuntimeError):
+            fsm.transition_to(fsm.ACTIVE) # OFF -> ACTIVE (skipping ARMING) is now strictly forbidden
 
     def test_independent_head_a_trigger(self):
         """Head A alone should trigger autonomous isolation."""
