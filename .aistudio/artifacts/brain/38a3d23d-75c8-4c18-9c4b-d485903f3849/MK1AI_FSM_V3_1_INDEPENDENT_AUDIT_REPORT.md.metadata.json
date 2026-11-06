@@ -1,0 +1,5 @@
+{
+  "summary": "MK1Ai FSM V3.1 Independent Security Audit Report (A-T sections), covering 49 state transitions, F-01..F-12 verification results, 15 concrete vulnerabilities (5 P0, 6 P1, 3 P2, 1 P3), microsecond latency benchmarks, and prioritized remediation plan.",
+  "updatedAt": "2026-11-06T11:02:11.651103586Z",
+  "userFacing": true
+}

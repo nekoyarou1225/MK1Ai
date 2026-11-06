@@ -9,11 +9,17 @@ class TestV3Remediation(unittest.TestCase):
     def setUp(self):
         # Reset state before each test
         defender.toggle_oni_mode(False)
-        # Force state to ACTIVE for most tests
         defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._save_persistent_state()
         defender._KILL_SWITCH_TRIGGERED = False
         defender._anomaly_counter = 0
         defender._ISOLATION_APPROVAL_PENDING = False
+
+    def tearDown(self):
+        defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._save_persistent_state()
 
     def test_v3_fsm_states(self):
         """Verify the presence of all 7 V3 states."""
@@ -67,7 +73,7 @@ class TestV3Remediation(unittest.TestCase):
             fsm.transition_to(fsm.ACTIVE) # OFF -> ACTIVE (skipping ARMING) is now strictly forbidden
 
     def test_independent_head_a_trigger(self):
-        """Head A alone should trigger autonomous isolation."""
+        """Head A alone should trigger autonomous isolation (simulated in dry_run without polluting production _state)."""
         # score_a >= 0.99 is P0
         defender.evaluate_threat_state(
             interface="eth0", 
@@ -75,10 +81,11 @@ class TestV3Remediation(unittest.TestCase):
             score_a=0.99, 
             autonomous=True
         )
-        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ACTIVE)
+        self.assertEqual(defender._SAFETY_FSM.simulated_state, MK1SafetyStateMachine.ISOLATED)
 
     def test_independent_head_b_trigger(self):
-        """Head B alone should trigger autonomous isolation."""
+        """Head B alone should trigger autonomous isolation (simulated in dry_run without polluting production _state)."""
         # score_b >= 0.98 is P0
         defender.evaluate_threat_state(
             interface="eth0", 
@@ -86,10 +93,11 @@ class TestV3Remediation(unittest.TestCase):
             score_b=0.98, 
             autonomous=True
         )
-        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ACTIVE)
+        self.assertEqual(defender._SAFETY_FSM.simulated_state, MK1SafetyStateMachine.ISOLATED)
 
     def test_independent_head_c_trigger(self):
-        """Head C alone should trigger autonomous isolation."""
+        """Head C alone should trigger autonomous isolation (simulated in dry_run without polluting production _state)."""
         # score_c >= 0.95 is P0
         defender.evaluate_threat_state(
             interface="eth0", 
@@ -97,17 +105,18 @@ class TestV3Remediation(unittest.TestCase):
             score_c=0.95, 
             autonomous=True
         )
-        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ACTIVE)
+        self.assertEqual(defender._SAFETY_FSM.simulated_state, MK1SafetyStateMachine.ISOLATED)
 
     def test_recovery_gate_logic(self):
         """Restoration must pass through RECOVERY_APPROVED."""
         defender._SAFETY_FSM._state = MK1SafetyStateMachine.ISOLATED
+        defender._SAFETY_FSM._save_persistent_state()
         
         # Mocking recovery call without approval
         success = defender._SAFETY_FSM.request_recovery(None, None, None)
         self.assertFalse(success)
-        # Should be in RECOVERY_PENDING or rolled back to ISOLATED
-        self.assertIn(defender._SAFETY_FSM.current_state, [MK1SafetyStateMachine.RECOVERY_PENDING, MK1SafetyStateMachine.ISOLATED])
+        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ISOLATED)
 
 if __name__ == "__main__":
     unittest.main()

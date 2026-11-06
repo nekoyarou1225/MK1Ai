@@ -419,6 +419,47 @@ def generate_operator_keypair(operator_id: str) -> dict[str, bytes | str]:
     }
 
 
+MAX_VALID_EPOCH = 4_102_444_800  # 2100-01-01T00:00:00Z
+MAX_CHALLENGE_TTL_SEC = 86_400
+
+
+def generate_secure_event_id(prefix: str = "evt") -> str:
+    """Generate a cryptographically random 128-bit event or challenge identifier."""
+    import secrets
+    clean_prefix = prefix.strip() if isinstance(prefix, str) and prefix.strip().isalnum() else "id"
+    return f"{clean_prefix}-{secrets.token_hex(16)}"
+
+
+def _validate_finite_int_timestamp(value: object, field_name: str) -> int:
+    """Validate that a timestamp is a finite, positive integer (rejecting bool, float NaN/Inf, negative, None)."""
+    import math
+    if value is None or isinstance(value, bool):
+        raise QuorumError(f"Quorum timestamp '{field_name}' must be an integer (got {type(value).__name__})")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise QuorumError(f"Quorum timestamp '{field_name}' must be a finite integer")
+        value = int(value)
+    if not isinstance(value, int):
+        raise QuorumError(f"Quorum timestamp '{field_name}' must be an integer")
+    if value <= 0 or value > MAX_VALID_EPOCH:
+        raise QuorumError(f"Quorum timestamp '{field_name}' is out of valid epoch range: {value}")
+    return value
+
+
+def _validate_identifier_token(value: object, field_name: str) -> str:
+    """Validate challenge_id / event_id is a non-empty bounded ASCII identifier."""
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or len(value) > 128
+        or not value.isascii()
+        or any(ord(ch) < 33 or ord(ch) > 126 for ch in value)
+    ):
+        raise QuorumError(f"Quorum field '{field_name}' must be a non-empty printable ASCII string (1..128 chars)")
+    return value
+
+
 def create_quorum_challenge(
     operation: str,
     parameters: Mapping[str, object] | None = None,
@@ -428,6 +469,7 @@ def create_quorum_challenge(
     ttl_sec: int = 300,
     now: int = 1_700_000_000,
     challenge_id: str = "chg-default",
+    policy_version: int = 1,
 ) -> dict[str, object]:
     """Build a canonical M-of-N operational quorum challenge document.
     
@@ -437,26 +479,46 @@ def create_quorum_challenge(
     """
     if not isinstance(operation, str) or not operation.strip():
         raise QuorumError("Quorum challenge operation must be a non-empty string")
-    if required_m < 2 or total_n < required_m or total_n > MAX_APPROVALS:
+    if (
+        isinstance(required_m, bool)
+        or not isinstance(required_m, int)
+        or isinstance(total_n, bool)
+        or not isinstance(total_n, int)
+        or required_m < 2
+        or total_n < required_m
+        or total_n > MAX_APPROVALS
+    ):
         raise QuorumError("Quorum challenge threshold must satisfy 2 <= M <= N <= 3")
-    
-    # Operation-specific prefixing
+    if isinstance(ttl_sec, bool) or not isinstance(ttl_sec, int) or ttl_sec < 1 or ttl_sec > MAX_CHALLENGE_TTL_SEC:
+        raise QuorumError(f"Quorum challenge ttl_sec must be an integer in 1..{MAX_CHALLENGE_TTL_SEC}")
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int) or policy_version < 1:
+        raise QuorumError("Quorum challenge policy_version must be a positive integer")
+    clean_challenge_id = _validate_identifier_token(challenge_id, "challenge_id")
+    issued_at = _validate_finite_int_timestamp(now, "now")
+    expires_at = _validate_finite_int_timestamp(issued_at + ttl_sec, "expires_at")
+
+    # Operation-specific prefixing (CORE vs Decoy / Isolation vs Recovery domain separation)
     prefix = "MK1AI-QUARANTINE-RELEASE-v1"
     if operation == "ISOLATE_NETWORK":
         prefix = "MK1AI-ISOLATE-v1"
     elif "RELEASE" in operation or "RECOVERY" in operation:
         prefix = "MK1AI-RECOVERY-v1"
-    
-    issued_at = int(now)
-    expires_at = issued_at + max(1, int(ttl_sec))
-    
-    # We include the prefix in the challenge to be signed to ensure domain separation
+
+    params_dict = dict(parameters or {})
+    if "policy_version" in params_dict:
+        pv = params_dict["policy_version"]
+        if isinstance(pv, bool) or not isinstance(pv, int) or pv < 1:
+            raise QuorumError("Quorum challenge parameters.policy_version must be a positive integer")
+        policy_version = pv
+
+    # Include prefix and policy_version in the signed document for strict cryptographic binding
     doc: dict[str, object] = {
         "version": 1,
-        "challenge_id": str(challenge_id),
+        "policy_version": policy_version,
+        "challenge_id": clean_challenge_id,
         "operation": operation,
         "prefix": prefix,
-        "parameters": dict(parameters or {}),
+        "parameters": params_dict,
         "required_m": int(required_m),
         "total_n": int(total_n),
         "issued_at": issued_at,
@@ -518,18 +580,69 @@ def verify_quorum_bundle(
     now: int | None = None,
 ) -> dict[str, object]:
     """Verify a structured M-of-N Ed25519 quorum approval bundle against challenge_document."""
+    import time as _time_mod
+
     if not _CRYPTOGRAPHY_AVAILABLE or serialization is None:
         raise QuorumError("cryptography library is required for Ed25519 quorum operations")
     if not isinstance(challenge_document, Mapping):
         raise QuorumError("challenge_document must be a mapping")
-    if expected_operation is not None and challenge_document.get("operation") != expected_operation:
-        raise QuorumError("Quorum challenge operation mismatch")
-    if now is not None:
-        expires_at = challenge_document.get("expires_at")
-        if isinstance(expires_at, int) and int(now) > expires_at:
-            raise QuorumError("Quorum challenge has expired")
 
-    threshold = int(challenge_document.get("required_m", 2))
+    operation = challenge_document.get("operation")
+    if not isinstance(operation, str) or not operation.strip():
+        raise QuorumError("Quorum challenge is missing mandatory 'operation' field")
+    if expected_operation is not None and operation != expected_operation:
+        raise QuorumError("Quorum challenge operation mismatch")
+
+    # Mandatory challenge_id validation
+    _validate_identifier_token(challenge_document.get("challenge_id"), "challenge_id")
+
+    # Mandatory domain prefix validation (CORE vs Decoy / operation separation)
+    prefix = challenge_document.get("prefix")
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise QuorumError("Quorum challenge is missing mandatory 'prefix' field")
+    if operation == "ISOLATE_NETWORK" and prefix != "MK1AI-ISOLATE-v1":
+        raise QuorumError(f"Invalid domain prefix '{prefix}' for ISOLATE_NETWORK")
+    if operation == "RELEASE_QUARANTINE" and prefix != "MK1AI-RECOVERY-v1":
+        raise QuorumError(f"Invalid domain prefix '{prefix}' for RELEASE_QUARANTINE")
+
+    # Mandatory event_id and policy_version when releasing quarantine
+    params = challenge_document.get("parameters")
+    if params is not None and not isinstance(params, Mapping):
+        raise QuorumError("Quorum challenge 'parameters' must be a mapping")
+    params_map = params if isinstance(params, Mapping) else {}
+    if operation == "RELEASE_QUARANTINE":
+        raw_evt = challenge_document.get("event_id", params_map.get("event_id"))
+        _validate_identifier_token(raw_evt, "event_id")
+        if "policy_version" in challenge_document:
+            raw_pv = challenge_document.get("policy_version")
+        elif "policy_version" in params_map:
+            raw_pv = params_map.get("policy_version")
+        else:
+            raise QuorumError("Quorum challenge for RELEASE_QUARANTINE is missing mandatory 'policy_version'")
+        if isinstance(raw_pv, bool) or not isinstance(raw_pv, int) or raw_pv < 1:
+            raise QuorumError("Quorum challenge 'policy_version' must be a positive integer")
+        domain_tag = params_map.get("domain")
+        if domain_tag is not None and domain_tag != "MK1AI-RECOVERY-v1":
+            raise QuorumError(f"Quorum challenge domain mismatch (Decoy/foreign domain rejected): {domain_tag}")
+
+    # Mandatory timestamp and expiration / future issuance checks (issued_at <= now <= expires_at)
+    issued_at = _validate_finite_int_timestamp(challenge_document.get("issued_at"), "issued_at")
+    expires_at = _validate_finite_int_timestamp(challenge_document.get("expires_at"), "expires_at")
+    if expires_at < issued_at:
+        raise QuorumError("Quorum challenge expires_at precedes issued_at")
+    if expires_at - issued_at > MAX_CHALLENGE_TTL_SEC:
+        raise QuorumError("Quorum challenge TTL exceeds maximum allowed window")
+
+    current_ts = _validate_finite_int_timestamp(int(_time_mod.time()) if now is None else now, "now")
+    if current_ts < issued_at:
+        raise QuorumError("Quorum challenge issued_at is in the future")
+    if current_ts > expires_at:
+        raise QuorumError("Quorum challenge has expired")
+
+    raw_req_m = challenge_document.get("required_m", 2)
+    if isinstance(raw_req_m, bool) or not isinstance(raw_req_m, int) or raw_req_m < 2:
+        raise QuorumError("Quorum challenge required_m must be an integer >= 2")
+    threshold = raw_req_m
     loaded_keys: dict[str, Ed25519PublicKey] = {}
     for signer_id, raw_key in trusted_keys.items():
         if isinstance(raw_key, Ed25519PublicKey):

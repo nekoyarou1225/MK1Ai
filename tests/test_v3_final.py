@@ -11,6 +11,9 @@ from airgap_ai_defender import MK1SafetyStateMachine, LightweightMultiTaskAI
 import mk1_quorum
 
 
+import unittest.mock as mock
+
+
 class TestV3FinalRemediation(unittest.TestCase):
 
     def setUp(self):
@@ -25,13 +28,20 @@ class TestV3FinalRemediation(unittest.TestCase):
         defender.toggle_oni_mode(False)
         defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
         defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._save_persistent_state()
         defender._KILL_SWITCH_TRIGGERED = False
         defender._KILL_SWITCH_EVENT.clear()
         defender._LAST_KILL_SWITCH_TRIGGER = 0.0
         defender._anomaly_counter = 0
         defender._ISOLATION_APPROVAL_PENDING = False
+        self._ks_patcher = mock.patch.object(defender, "execute_kill_switch", return_value=True)
+        self.mock_kill_switch = self._ks_patcher.start()
 
     def tearDown(self):
+        self._ks_patcher.stop()
+        defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._save_persistent_state()
         self.temp_dir.cleanup()
 
     def _create_isolated_fsm(self, path=None, event_id="evt-001", challenge_id="chg-001"):
@@ -226,20 +236,20 @@ class TestV3FinalRemediation(unittest.TestCase):
         fsm.isolate_immediately(reason="Threat during RECOVERY_PENDING")
         self.assertEqual(fsm.current_state, fsm.ISOLATED)
 
-        # Reset context and test race between request_recovery and isolate_immediately
+        # Reset context and test true concurrent preemption during request_recovery without post-join masking
         fsm.set_isolation_context(event_id="evt-race", challenge_id="chg-race")
+        fsm._recovery_verification_delay_sec = 0.02
         barrier = threading.Barrier(2)
+        rec_results = []
 
         def _recovery_thread():
             barrier.wait(timeout=2.0)
-            try:
-                fsm.request_recovery(bundle, challenge, trusted)
-            except Exception:
-                pass
+            ok = fsm.request_recovery(bundle, challenge, trusted)
+            rec_results.append(ok)
 
         def _isolation_thread():
             barrier.wait(timeout=2.0)
-            time.sleep(0.002)
+            time.sleep(0.005)
             fsm.isolate_immediately(reason="Preemptive emergency isolation")
 
         t1 = threading.Thread(target=_recovery_thread, daemon=True)
@@ -248,8 +258,9 @@ class TestV3FinalRemediation(unittest.TestCase):
         t2.start()
         t1.join(timeout=2.0)
         t2.join(timeout=2.0)
+        fsm._recovery_verification_delay_sec = 0.0
 
-        fsm.isolate_immediately(reason="Final safety assertion")
+        self.assertEqual(rec_results, [False])
         self.assertEqual(fsm.current_state, fsm.ISOLATED)
 
     # =========================================================================
@@ -480,6 +491,11 @@ class TestV3FinalRemediation(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertEqual(fsm.current_state, fsm.ISOLATED)
+
+        # P1-006: Because persistence failed before commit, tokens were not permanently burned; retry succeeds
+        retry_ok = fsm.request_recovery(bundle, challenge, trusted)
+        self.assertTrue(retry_ok)
+        self.assertEqual(fsm.current_state, fsm.ACTIVE)
 
     # =========================================================================
     # P1-4: FSM Generation Rollback & HMAC Hardening (TEST-ROLLBACK-001..005)
