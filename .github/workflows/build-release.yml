@@ -64,7 +64,7 @@ jobs:
           pkg-config --exists liboqs
 
       - name: Install Python test tools
-        run: python -m pip install --require-hashes -r requirements-ci.lock -r requirements-model.lock
+        run: python -m pip install -r requirements-ci.in -r requirements-model.in
 
       - name: Native tests and static analysis (liboqs required)
         run: make check-ci
