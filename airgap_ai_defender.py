@@ -3451,10 +3451,12 @@ def _get_default_production_fsm_paths(*, require_explicit_dir: bool = False) -> 
     else:
         home_dir = os.path.abspath(os.path.expanduser("~"))
         tmp_root = os.path.abspath(tempfile.gettempdir())
-        if home_dir == tmp_root or home_dir.startswith(tmp_root + os.sep):
-            base_dir = os.path.abspath(f"/var/tmp/mk1ai_sovereign_fsm_v32_uid_{uid_tag}")
+        if home_dir == tmp_root or home_dir.startswith(tmp_root + os.sep) or uid_tag == 0:
+            # Section 3.1: Use /var/lib/mk1ai/fsm for root or when home is in /tmp
+            base_dir = "/var/lib/mk1ai/fsm"
         else:
-            base_dir = os.path.join(home_dir, ".local", "state", f"mk1ai_sovereign_fsm_v32_uid_{uid_tag}")
+            # Section 3.1: Use ~/.local/share/mk1ai/fsm for non-root users
+            base_dir = os.path.join(home_dir, ".local", "share", "mk1ai", "fsm")
 
     state_dir = os.path.join(base_dir, "state")
     journal_dir = os.path.join(base_dir, "journal")

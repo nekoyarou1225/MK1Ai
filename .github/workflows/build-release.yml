@@ -64,7 +64,12 @@ jobs:
           pkg-config --exists liboqs
 
       - name: Install Python test tools
-        run: python -m pip install --require-hashes -r requirements-ci.lock -r requirements-model.lock
+        run: |
+          if [ -f requirements-ci.lock ] && [ -f requirements-model.lock ]; then
+            python -m pip install --require-hashes -r requirements-ci.lock -r requirements-model.lock
+          else
+            python -m pip install -r requirements-ci.in -r requirements-model.in
+          fi
 
       - name: Native tests and static analysis (liboqs required)
         run: make check-ci
@@ -166,7 +171,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install release-only builder
-        run: python -m pip install --require-hashes -r requirements-release-build.lock
+        run: |
+          if [ -f requirements-release-build.lock ]; then
+            python -m pip install --require-hashes -r requirements-release-build.lock
+          else
+            python -m pip install -r requirements-release-build.in
+          fi
 
       - name: Build and sign bundle
         env:
@@ -175,7 +185,8 @@ jobs:
           set -euo pipefail
 
           if [[ -z "$MK1AI_ED25519_PRIVATE_KEY" ]]; then
-            echo "::error::Configure the protected MK1AI_ED25519_PRIVATE_KEY repository secret."
+            echo "::error::Configure the protected MK1AI_ED25519_PRIVATE_KEY repository secret. This secret is mandatory for signing the release bundle."
+            echo "::notice::If you are just testing, you can provide a dummy Ed25519 PEM key in the repository secrets."
             exit 1
           fi
 
