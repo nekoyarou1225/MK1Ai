@@ -651,6 +651,9 @@ class MK1SafetyStateMachine:
         self._generation = 0
         self._max_observed_generation = 0
         self._lock = threading.RLock()
+        self._flock_depth: int = 0
+        self._flock_owner_tid: int | None = None
+        self._flock_fd: int | None = None
 
         # P0-003: Atomic Emergency Preemption Latch & Epoch
         self._emergency_preempt_lock = threading.Lock()
@@ -669,12 +672,15 @@ class MK1SafetyStateMachine:
         self._reserved_recovery_tokens: set[str] = set()
         self._consumed_recovery_tokens: set[str] = set()
 
-        # Integrity, Rollback, and Boot Status (P0-004, P1-002, P1-003)
+        # Integrity, Rollback, and Boot Status (P0-004, P1-002, P1-003, R-002)
         self._authenticity_status = "UNVERIFIED"
         self._rollback_protection_status = "UNINITIALIZED" if self._journal_path else "UNAVAILABLE"
         self._boot_integrity_status = "CLEAN_INIT"
+        self._wal_status = "UNINITIALIZED"
         self._simulate_persistence_failure = False
         self._simulate_journal_failure = False
+        self._persistence_io_delay_sec: float = 0.0
+        self._wal_fault_hook = None
         self._audit_trail: list[dict[str, Any]] = []
 
         # P0-005: Kill Switch Status & Network Block Confirmation
@@ -832,20 +838,39 @@ class MK1SafetyStateMachine:
             return True
 
     class _TimedLockContext:
-        """Two-level hierarchical lock: in-process RLock + OS cross-process file lock (fcntl.flock) (P1-004)."""
+        """Two-level hierarchical lock: in-process RLock + OS cross-process file lock (fcntl.flock) (P1-004, R-001).
+
+        Enforces strict thread ownership and reentrancy tracking:
+        - Nested acquisitions by the owning thread increment _flock_depth without re-opening or re-flocking.
+        - Only the outermost acquisition (depth 0 -> 1) acquires the OS-level fcntl.flock.
+        - Only the outermost release (depth 1 -> 0) unlocks and closes the OS-level fcntl.flock.
+        """
 
         def __init__(self, fsm: "MK1SafetyStateMachine", timeout: float):
             self._fsm = fsm
             self._rlock = fsm._lock
             self._timeout = timeout
             self._acquired_rlock = False
-            self._lock_fd: int | None = None
 
         def __enter__(self):
             deadline = time.monotonic() + self._timeout
             self._acquired_rlock = self._rlock.acquire(timeout=self._timeout)
             if not self._acquired_rlock:
                 raise TimeoutError("FSM lock acquisition timed out (potential deadlock prevented)")
+
+            tid = threading.get_ident()
+            if self._fsm._flock_depth > 0:
+                if self._fsm._flock_owner_tid != tid:
+                    self._rlock.release()
+                    self._acquired_rlock = False
+                    raise RuntimeError(
+                        f"FSM lock thread ownership violation: owned by {self._fsm._flock_owner_tid}, requested by {tid}"
+                    )
+                self._fsm._flock_depth += 1
+                return self
+
+            # Outermost acquisition (depth 0 -> 1): acquire OS-level fcntl.flock if state_path is configured
+            fd: int | None = None
             if self._fsm._lock_path and _fcntl_mod is not None:
                 try:
                     parent = os.path.dirname(self._fsm._lock_path)
@@ -855,11 +880,14 @@ class MK1SafetyStateMachine:
                     while True:
                         try:
                             _fcntl_mod.flock(fd, _fcntl_mod.LOCK_EX | _fcntl_mod.LOCK_NB)
-                            self._lock_fd = fd
+                            self._fsm._flock_fd = fd
                             break
                         except (BlockingIOError, IOError):
                             if time.monotonic() >= deadline:
-                                os.close(fd)
+                                try:
+                                    os.close(fd)
+                                except OSError:
+                                    pass
                                 self._rlock.release()
                                 self._acquired_rlock = False
                                 raise TimeoutError("FSM inter-process file lock timed out")
@@ -867,30 +895,41 @@ class MK1SafetyStateMachine:
                 except TimeoutError:
                     raise
                 except Exception as exc:
-                    if self._lock_fd is not None:
+                    if fd is not None:
                         try:
-                            os.close(self._lock_fd)
+                            os.close(fd)
                         except OSError:
                             pass
-                        self._lock_fd = None
+                    self._fsm._flock_fd = None
                     log.warning(f"[FSM] プロセス間ロック取得警告 ({exc})")
+
+            self._fsm._flock_owner_tid = tid
+            self._fsm._flock_depth = 1
             return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
-            if self._lock_fd is not None:
-                try:
-                    if _fcntl_mod is not None:
-                        _fcntl_mod.flock(self._lock_fd, _fcntl_mod.LOCK_UN)
-                except OSError:
-                    pass
-                try:
-                    os.close(self._lock_fd)
-                except OSError:
-                    pass
-                self._lock_fd = None
             if self._acquired_rlock:
-                self._rlock.release()
-                self._acquired_rlock = False
+                try:
+                    if self._fsm._flock_depth > 1:
+                        self._fsm._flock_depth -= 1
+                    else:
+                        self._fsm._flock_depth = 0
+                        self._fsm._flock_owner_tid = None
+                        if self._fsm._flock_fd is not None:
+                            fd_to_close = self._fsm._flock_fd
+                            self._fsm._flock_fd = None
+                            try:
+                                if _fcntl_mod is not None:
+                                    _fcntl_mod.flock(fd_to_close, _fcntl_mod.LOCK_UN)
+                            except OSError:
+                                pass
+                            try:
+                                os.close(fd_to_close)
+                            except OSError:
+                                pass
+                finally:
+                    self._rlock.release()
+                    self._acquired_rlock = False
             return False
 
     def _acquire_lock(self, timeout: float | None = None) -> "_TimedLockContext":
@@ -930,9 +969,25 @@ class MK1SafetyStateMachine:
         payload = f"{state}:{ts}:{generation}".encode("utf-8")
         return hmac.new(self._hmac_key, payload, hashlib.sha256).hexdigest()
 
-    def _compute_journal_mac(self, max_gen: int, state: str) -> str:
-        payload = f"JOURNAL:{max_gen}:{state}".encode("utf-8")
+    def _compute_journal_mac(self, max_gen: int, state: str, status: str = "COMMITTED") -> str:
+        payload = f"JOURNAL:v3.2:{status}:{max_gen}:{state}".encode("utf-8")
         return hmac.new(self._hmac_key, payload, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _fsync_parent_dir(file_path: str | None) -> None:
+        if not file_path:
+            return
+        parent = os.path.dirname(file_path)
+        if not parent or not os.path.isdir(parent):
+            return
+        try:
+            dfd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
 
     def _cleanup_stale_temp_files(self) -> None:
         if not self._state_path:
@@ -955,10 +1010,13 @@ class MK1SafetyStateMachine:
             pass
 
     def _read_journal_record(self) -> tuple[int, str | None, str]:
-        """Read and verify journal record.
+        """Read and verify journal record (R-002).
 
         Returns (max_generation, last_state, status_code) where status_code is one of:
-        'VERIFIED', 'MISSING', 'CORRUPTED'.
+        - 'VERIFIED': Valid COMMITTED journal record.
+        - 'PREPARED_INCOMPLETE': Valid PREPARED journal record (interrupted uncommitted WAL transaction).
+        - 'MISSING': Journal file does not exist.
+        - 'CORRUPTED': Malformed JSON, invalid schema, or HMAC mismatch.
         """
         if not self._journal_path or not os.path.isfile(self._journal_path):
             return (0, None, "MISSING")
@@ -970,6 +1028,7 @@ class MK1SafetyStateMachine:
             max_gen = jdata.get("max_generation")
             jstate = jdata.get("last_state")
             jmac = jdata.get("journal_mac")
+            jstatus = jdata.get("status", "COMMITTED")
             if (
                 isinstance(max_gen, bool)
                 or not isinstance(max_gen, int)
@@ -977,11 +1036,18 @@ class MK1SafetyStateMachine:
                 or not isinstance(jstate, str)
                 or jstate not in self.VALID_STATES
                 or not isinstance(jmac, str)
+                or not isinstance(jstatus, str)
+                or jstatus not in ("PREPARED", "COMMITTED")
             ):
                 raise ValueError("Invalid journal schema")
-            expected_jmac = self._compute_journal_mac(max_gen, jstate)
+            expected_jmac = self._compute_journal_mac(max_gen, jstate, status=jstatus)
             if not hmac.compare_digest(expected_jmac, jmac):
-                raise ValueError("Journal HMAC verification failed")
+                # Backward-compatibility check for legacy V3.2 records without status field in MAC
+                legacy_jmac = hmac.new(self._hmac_key, f"JOURNAL:{max_gen}:{jstate}".encode("utf-8"), hashlib.sha256).hexdigest()
+                if not ("status" not in jdata and hmac.compare_digest(legacy_jmac, jmac)):
+                    raise ValueError("Journal HMAC verification failed")
+            if jstatus == "PREPARED":
+                return (max_gen, jstate, "PREPARED_INCOMPLETE")
             return (max_gen, jstate, "VERIFIED")
         except Exception as exc:
             log.critical(f"[FSM] 世代ジャーナル破損検知 ({exc})。Fail-Closed を適用します。")
@@ -991,22 +1057,41 @@ class MK1SafetyStateMachine:
         max_gen, _, _ = self._read_journal_record()
         return max_gen
 
-    def _write_journal_max_generation(self, generation: int, state: str) -> bool:
+    def _write_journal_record(
+        self,
+        generation: int,
+        state: str,
+        *,
+        status: str = "COMMITTED",
+        prev_generation: int | None = None,
+        prev_state: str | None = None,
+    ) -> bool:
+        """Write and fsync a PREPARED or COMMITTED WAL record to the journal file (R-002)."""
         if self._simulate_journal_failure:
             log.error("[FSM] シミュレーションされたジャーナル書き込み失敗が発生しました。")
             return False
         if not self._journal_path:
+            self._wal_status = status
             return True
+        if status not in ("PREPARED", "COMMITTED"):
+            raise ValueError(f"Invalid WAL status: {status}")
         try:
             parent_dir = os.path.dirname(self._journal_path)
             if parent_dir:
                 os.makedirs(parent_dir, exist_ok=True)
             high_water = max(generation, self._max_observed_generation)
-            jdata = {
+            jdata: dict[str, Any] = {
+                "version": "3.2",
+                "status": status,
                 "max_generation": high_water,
                 "last_state": state,
-                "journal_mac": self._compute_journal_mac(high_water, state),
+                "journal_mac": self._compute_journal_mac(high_water, state, status=status),
             }
+            if prev_generation is not None:
+                jdata["prev_generation"] = int(prev_generation)
+            if prev_state is not None:
+                jdata["prev_state"] = str(prev_state)
+
             jbase = os.path.basename(self._journal_path)
             fd, tmp_j = tempfile.mkstemp(
                 prefix=f".{jbase}.{os.getpid()}.{threading.get_ident()}.",
@@ -1019,18 +1104,55 @@ class MK1SafetyStateMachine:
                     jf.flush()
                     os.fsync(jf.fileno())
                 os.replace(tmp_j, self._journal_path)
+                self._fsync_parent_dir(self._journal_path)
             finally:
                 if os.path.exists(tmp_j):
                     try:
                         os.unlink(tmp_j)
                     except OSError:
                         pass
-            self._max_observed_generation = high_water
-            self._rollback_protection_status = "VERIFIED_JOURNAL"
+            self._wal_status = status
+            if status == "COMMITTED":
+                self._max_observed_generation = high_water
+                self._rollback_protection_status = "VERIFIED_JOURNAL"
+            else:
+                self._rollback_protection_status = "WAL_PREPARED"
             return True
         except Exception as exc:
-            log.error(f"[FSM] 世代ジャーナル書き込みエラー: {exc}")
+            log.error(f"[FSM] 世代ジャーナル({status})書き込みエラー: {exc}")
             self._rollback_protection_status = "DEGRADED_IO_ERROR"
+            return False
+
+    def _write_journal_max_generation(self, generation: int, state: str) -> bool:
+        return self._write_journal_record(generation, state, status="COMMITTED")
+
+    def _verify_committed_storage_consistency(self, expected_gen: int, expected_state: str) -> bool:
+        """Step 7 of R-002 WAL: Verify on-disk State and Journal match COMMITTED target state and generation."""
+        if not self._state_path:
+            return True
+        try:
+            if not os.path.isfile(self._state_path):
+                return False
+            with open(self._state_path, "r", encoding="utf-8") as sf:
+                sdata = json.load(sf)
+            if not isinstance(sdata, dict):
+                return False
+            s_gen = sdata.get("generation")
+            s_state = sdata.get("state")
+            s_ts = sdata.get("timestamp")
+            s_sig = sdata.get("integrity")
+            if s_gen != expected_gen or s_state != expected_state:
+                return False
+            if not isinstance(s_sig, str) or not hmac.compare_digest(
+                self._compute_integrity(str(s_state), float(s_ts), int(s_gen)), s_sig
+            ):
+                return False
+            if self._journal_path:
+                j_gen, j_state, j_status = self._read_journal_record()
+                if j_status != "VERIFIED" or j_gen != expected_gen or j_state != expected_state:
+                    return False
+            return True
+        except Exception:
             return False
 
     def _sync_from_disk_if_newer_locked(self) -> None:
@@ -1038,6 +1160,12 @@ class MK1SafetyStateMachine:
         if not self._state_path or not os.path.isfile(self._state_path):
             return
         try:
+            if self._journal_path and os.path.isfile(self._journal_path):
+                j_gen, _, j_status = self._read_journal_record()
+                if j_status in ("CORRUPTED", "PREPARED_INCOMPLETE"):
+                    return
+                if j_gen > self._max_observed_generation:
+                    self._max_observed_generation = j_gen
             with open(self._state_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
@@ -1049,7 +1177,8 @@ class MK1SafetyStateMachine:
             if (
                 isinstance(gen, int)
                 and not isinstance(gen, bool)
-                and gen > self._max_observed_generation
+                and gen > self._generation
+                and gen >= self._max_observed_generation
                 and isinstance(state, str)
                 and state in self.VALID_STATES
                 and isinstance(ts, (int, float))
@@ -1058,7 +1187,7 @@ class MK1SafetyStateMachine:
             ):
                 if hmac.compare_digest(self._compute_integrity(state, ts, gen), sig):
                     self._generation = gen
-                    self._max_observed_generation = gen
+                    self._max_observed_generation = max(self._max_observed_generation, gen)
                     self._state = state
                     self._simulated_state = state
                     self._last_transition = float(ts)
@@ -1069,12 +1198,16 @@ class MK1SafetyStateMachine:
             pass
 
     def _save_persistent_state(self) -> bool:
-        """Transactional persistence of Journal + State + Boot Anchor with unique temp files and fsync (P1-002, P1-004)."""
+        """Execute 7-Step 2-Phase WAL (PREPARED -> State Update -> COMMITTED -> Final Verification) (P1-002, P1-004, R-002)."""
+        if self._persistence_io_delay_sec > 0.0:
+            time.sleep(self._persistence_io_delay_sec)
         if self._simulate_persistence_failure:
             log.error("[FSM] シミュレーションされた永続化失敗が発生しました。")
             self._authenticity_status = "FAILED_PERSISTENCE"
             return False
         if not self._state_path:
+            self._wal_status = "COMMITTED"
+            self._authenticity_status = "VERIFIED"
             return True
 
         prev_journal_snapshot: bytes | None = None
@@ -1084,6 +1217,14 @@ class MK1SafetyStateMachine:
                     prev_journal_snapshot = jf.read()
             except OSError:
                 prev_journal_snapshot = None
+
+        prev_state_snapshot: bytes | None = None
+        if os.path.isfile(self._state_path):
+            try:
+                with open(self._state_path, "rb") as sf:
+                    prev_state_snapshot = sf.read()
+            except OSError:
+                prev_state_snapshot = None
 
         try:
             parent_dir = os.path.dirname(self._state_path)
@@ -1101,12 +1242,22 @@ class MK1SafetyStateMachine:
                 "integrity": sig,
             }
 
-            # Step 1: Write-ahead update of generation journal
-            if not self._write_journal_max_generation(self._generation, self._state):
+            # Step 1 & Step 2: Write PREPARED record to WAL Journal and fsync
+            if not self._write_journal_record(
+                self._generation,
+                self._state,
+                status="PREPARED",
+                prev_generation=max(0, self._generation - 1),
+            ):
                 self._authenticity_status = "FAILED_PERSISTENCE"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
                 return False
 
-            # Step 2: Atomic state file write with PID/TID unique temp file + fsync
+            if callable(self._wal_fault_hook):
+                self._wal_fault_hook("AFTER_PREPARED_FSYNC")
+
+            # Step 3 & Step 4: Write State to PID/TID unique temp file, fsync, and os.replace
             sbase = os.path.basename(self._state_path)
             fd, tmp_path = tempfile.mkstemp(
                 prefix=f".{sbase}.{os.getpid()}.{threading.get_ident()}.",
@@ -1117,15 +1268,45 @@ class MK1SafetyStateMachine:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(data, f, sort_keys=True)
                     f.flush()
+                    if callable(self._wal_fault_hook):
+                        self._wal_fault_hook("BEFORE_STATE_FSYNC")
                     os.fsync(f.fileno())
+                if callable(self._wal_fault_hook):
+                    self._wal_fault_hook("BEFORE_STATE_REPLACE")
                 os.replace(tmp_path, self._state_path)
+                self._fsync_parent_dir(self._state_path)
             except Exception:
                 if os.path.exists(tmp_path):
                     try:
                         os.unlink(tmp_path)
                     except OSError:
                         pass
-                # Rollback journal if state write failed so State & Journal remain consistent
+                # Restore previous committed journal snapshot if state write/replace failed
+                if self._journal_path and prev_journal_snapshot is not None:
+                    try:
+                        with open(self._journal_path, "wb") as jf:
+                            jf.write(prev_journal_snapshot)
+                            jf.flush()
+                            os.fsync(jf.fileno())
+                        self._wal_status = "COMMITTED"
+                    except OSError:
+                        pass
+                raise
+
+            if callable(self._wal_fault_hook):
+                self._wal_fault_hook("AFTER_STATE_REPLACE_BEFORE_COMMITTED")
+
+            # Step 5 & Step 6: Write COMMITTED record to WAL Journal and fsync
+            if not self._write_journal_record(self._generation, self._state, status="COMMITTED"):
+                # Rollback state & journal if COMMITTED write failed
+                if prev_state_snapshot is not None:
+                    try:
+                        with open(self._state_path, "wb") as sf:
+                            sf.write(prev_state_snapshot)
+                            sf.flush()
+                            os.fsync(sf.fileno())
+                    except OSError:
+                        pass
                 if self._journal_path and prev_journal_snapshot is not None:
                     try:
                         with open(self._journal_path, "wb") as jf:
@@ -1134,19 +1315,40 @@ class MK1SafetyStateMachine:
                             os.fsync(jf.fileno())
                     except OSError:
                         pass
-                raise
+                self._authenticity_status = "FAILED_PERSISTENCE"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return False
 
-            # Step 3: Update provisioning boot anchor
-            self._anchor.write_anchor(self._generation, self._state)
+            # Update provisioning boot anchor
+            if not self._anchor.write_anchor(self._generation, self._state):
+                self._authenticity_status = "FAILED_PERSISTENCE"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return False
+
+            if callable(self._wal_fault_hook):
+                self._wal_fault_hook("BEFORE_FINAL_VERIFICATION")
+
+            # Step 7: Final State & Journal Cross-Verification
+            if not self._verify_committed_storage_consistency(self._generation, self._state):
+                log.critical("[FSM] Step 7 最終永続化照合に失敗しました。Fail-Closed を適用します。")
+                self._authenticity_status = "FAILED_PERSISTENCE"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return False
+
             self._authenticity_status = "VERIFIED"
             return True
         except Exception as exc:
             log.error(f"[FSM] 状態永続化エラー: {exc}")
             self._authenticity_status = "FAILED_PERSISTENCE"
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
             return False
 
     def _load_persistent_state(self) -> None:
-        """Load and cross-verify State, Journal, and Boot Anchor with Fail-Closed guarantees (P0-001, P0-004, P1-003, P2-002, P2-003)."""
+        """Load and cross-verify State, Journal (COMMITTED vs PREPARED), and Boot Anchor with Fail-Closed guarantees (P0-001, P0-004, P1-003, P2-002, P2-003, R-002)."""
         if not self._state_path:
             return
         with self._acquire_lock():
@@ -1175,7 +1377,7 @@ class MK1SafetyStateMachine:
             if not state_exists and journal_exists:
                 j_gen, _, j_status = self._read_journal_record()
                 log.critical("[FSM] 永続Stateファイルが欠損しています(Journalは存在)！ Fail-ClosedによりISOLATEDに固定します。")
-                self._generation = max(1, j_gen if j_status == "VERIFIED" else 1)
+                self._generation = max(1, j_gen if j_status in ("VERIFIED", "PREPARED_INCOMPLETE") else 1)
                 self._max_observed_generation = self._generation
                 self._authenticity_status = "FAILED_MISSING_STATE"
                 self._rollback_protection_status = "VIOLATION_MISSING_STATE"
@@ -1235,11 +1437,26 @@ class MK1SafetyStateMachine:
                     self._simulated_state = self.ISOLATED
                     return
 
-                # Case 3: Cross-check State vs Journal & Anchor (P0-004, P1-003)
+                # Case 3: Cross-check State vs Journal (COMMITTED vs PREPARED) & Anchor (P0-004, P1-003, R-002)
                 journal_max_gen, journal_last_state, journal_status = self._read_journal_record()
                 if journal_status == "CORRUPTED":
                     self._authenticity_status = "FAILED_ROLLBACK"
                     self._rollback_protection_status = "CORRUPTED_JOURNAL"
+                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                    self._state = self.ISOLATED
+                    self._simulated_state = self.ISOLATED
+                    return
+
+                if journal_status == "PREPARED_INCOMPLETE":
+                    log.critical(
+                        f"[FSM] 未完了のWALトランザクション(status=PREPARED, journal_gen={journal_max_gen}, "
+                        f"state_gen={gen})を検知！ 不完全トランザクションからのACTIVE復元を禁止し、ISOLATEDに固定します。"
+                    )
+                    self._generation = max(gen, journal_max_gen)
+                    self._max_observed_generation = self._generation
+                    self._wal_status = "PREPARED"
+                    self._authenticity_status = "FAILED_WAL_INCOMPLETE"
+                    self._rollback_protection_status = "WAL_INCOMPLETE_PREPARED"
                     self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
                     self._state = self.ISOLATED
                     self._simulated_state = self.ISOLATED
@@ -1267,7 +1484,10 @@ class MK1SafetyStateMachine:
                         "Fail-Closed により ISOLATED に固定します。"
                     )
                     self._authenticity_status = "FAILED_ROLLBACK"
-                    self._rollback_protection_status = "ROLLBACK_DETECTED"
+                    if anchor_prov and gen < anchor_min_gen and gen >= journal_max_gen:
+                        self._rollback_protection_status = "ANCHOR_ROLLBACK_DETECTED"
+                    else:
+                        self._rollback_protection_status = "ROLLBACK_DETECTED"
                     self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
                     self._state = self.ISOLATED
                     self._simulated_state = self.ISOLATED
@@ -1296,6 +1516,7 @@ class MK1SafetyStateMachine:
                     self._state = self.ISOLATED
                     self._simulated_state = self.ISOLATED
                     return
+                self._wal_status = "COMMITTED"
 
                 # Restore verified metadata
                 self._generation = gen
@@ -1481,6 +1702,11 @@ class MK1SafetyStateMachine:
         with self._acquire_lock():
             return self._authenticity_status
 
+    @property
+    def rollback_protection_status(self) -> str:
+        with self._acquire_lock():
+            return self._rollback_protection_status
+
     def record_kill_switch_state(self, status: str, *, confirmed: bool = False) -> None:
         """Update independent Kill Switch OS containment status (P0-005)."""
         if status not in self.VALID_KILL_SWITCH_STATES:
@@ -1604,6 +1830,8 @@ class MK1SafetyStateMachine:
 
         if new_state == self.EMERGENCY:
             _ONI_MODE_ACTIVE.set()
+        elif new_state in (self.ACTIVE, self.OFF):
+            _ONI_MODE_ACTIVE.clear()
         if new_state == self.ISOLATED and self._kill_switch_status == self.KS_NOT_REQUESTED:
             self._kill_switch_status = self.KS_LOGICALLY_ISOLATED
             self._network_block_confirmed = False
@@ -7264,11 +7492,25 @@ def handle_admin_recovery_signal(token: str | None = None, interface: str | None
     return {"authorized": True, "recovered": True, "reason": "authorized", "commands": commands}
 
 
-def _apply_anomaly_decay(now: float | None = None) -> tuple[float, bool]:
+def _apply_anomaly_decay(now: float | None = None, *, simulated: bool = False) -> tuple[float, bool]:
     """長期間の正常通信が続いた場合に異常カウンターを減衰させる。"""
     global _anomaly_counter, _ANOMALY_DECAY_LAST_TIME
+    global _simulated_anomaly_counter, _SIMULATED_ANOMALY_DECAY_LAST_TIME
     if now is None:
         now = time.time()
+    if simulated:
+        sim_last = globals().get("_SIMULATED_ANOMALY_DECAY_LAST_TIME", 0.0)
+        sim_cnt = globals().get("_simulated_anomaly_counter", 0)
+        if sim_last <= 0.0:
+            _SIMULATED_ANOMALY_DECAY_LAST_TIME = now
+            return _SIMULATED_ANOMALY_DECAY_LAST_TIME, False
+        elapsed = now - sim_last
+        if elapsed >= _ANOMALY_DECAY_WINDOW_SEC:
+            _simulated_anomaly_counter = max(0, sim_cnt - 1)
+            _SIMULATED_ANOMALY_DECAY_LAST_TIME = now
+            return _SIMULATED_ANOMALY_DECAY_LAST_TIME, True
+        return sim_last, False
+
     if _ANOMALY_DECAY_LAST_TIME <= 0.0:
         _ANOMALY_DECAY_LAST_TIME = now
         return _ANOMALY_DECAY_LAST_TIME, False
@@ -7284,7 +7526,7 @@ def verify_event_isolation_approval(
     approval_bundle: dict | None,
     *,
     challenge_document: dict | None,
-    trusted_keys: dict[str, bytes] | None,
+    trusted_keys: dict | None,
     interface: str | None = None,
     now: int | None = None,
 ) -> bool:
@@ -7323,7 +7565,7 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
     unless 'autonomous=True' and high-confidence P0 threat is detected in any of the 3 heads.
     """
     global _ISOLATION_APPROVAL_PENDING, _LAST_KILL_SWITCH_TRIGGER
-    global _anomaly_counter, _LAST_THREAT_SCORE
+    global _anomaly_counter, _simulated_anomaly_counter, _LAST_THREAT_SCORE
 
     target_fsm = fsm if fsm is not None else _SAFETY_FSM
     effective_dry_run = dry_run or is_learning_mode()
@@ -7364,9 +7606,9 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
         if backdoor_detected or corrupted_scores:
             effective_score_a = max(effective_score_a, 0.99)
 
-        # Anomaly counter decay logic (Head A driven; do not pollute production counter in dry_run)
+        # Anomaly counter decay logic (Head A driven; never pollute production _anomaly_counter in dry_run)
         if not effective_dry_run:
-            last_decay_at, decayed = _apply_anomaly_decay(now)
+            last_decay_at, decayed = _apply_anomaly_decay(now, simulated=False)
             if effective_score_a >= 0.95:
                 if _anomaly_counter > 0 and not decayed and now - last_decay_at < _ANOMALY_DECAY_WINDOW_SEC:
                     _anomaly_counter += 1
@@ -7376,7 +7618,17 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                 _anomaly_counter = max(0, _anomaly_counter - 1)
             active_anomaly_count = _anomaly_counter
         else:
-            active_anomaly_count = _anomaly_counter + (1 if effective_score_a >= 0.95 else 0)
+            sim_last_decay_at, sim_decayed = _apply_anomaly_decay(now, simulated=True)
+            sim_cnt = globals().get("_simulated_anomaly_counter", 0)
+            if effective_score_a >= 0.95:
+                if sim_cnt > 0 and not sim_decayed and now - sim_last_decay_at < _ANOMALY_DECAY_WINDOW_SEC:
+                    sim_cnt += 1
+                else:
+                    sim_cnt = 1
+            else:
+                sim_cnt = max(0, sim_cnt - 1)
+            _simulated_anomaly_counter = sim_cnt
+            active_anomaly_count = sim_cnt
 
         # Autonomous isolation trigger: P0 threat detection in ANY head (independent, no majority required)
         is_p0_a = backdoor_detected or corrupted_scores or active_anomaly_count >= 3 or effective_score_a >= 0.99
@@ -7442,7 +7694,11 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                     return False
 
                 if callable(getattr(target_fsm, "_network_block_verifier", None)):
-                    v_res = target_fsm._network_block_verifier(interface)
+                    try:
+                        v_res = target_fsm._network_block_verifier(interface)
+                    except Exception as exc:
+                        log.error(f"[AUTONOMOUS_DEFENSE] ネットワーク遮断検証中に例外が発生しました ({exc})")
+                        v_res = False
                     if v_res == "PARTIAL":
                         target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_PARTIALLY_ISOLATED, confirmed=False)
                         return False

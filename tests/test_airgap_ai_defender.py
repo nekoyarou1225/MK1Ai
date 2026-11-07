@@ -2118,27 +2118,39 @@ class AirgapSecurityHelpersTest(unittest.TestCase):
 
     def test_evaluate_threat_state_decays_anomaly_counter_after_cooldown(self):
         original_counter = module._anomaly_counter
+        original_sim_counter = getattr(module, "_simulated_anomaly_counter", 0)
         original_last_time = getattr(module, "_ANOMALY_DECAY_LAST_TIME", None)
+        original_sim_last_time = getattr(module, "_SIMULATED_ANOMALY_DECAY_LAST_TIME", None)
         original_window = getattr(module, "_ANOMALY_DECAY_WINDOW_SEC", None)
         original_triggered = module._KILL_SWITCH_TRIGGERED
         original_last_trigger = module._LAST_KILL_SWITCH_TRIGGER
         try:
             module._anomaly_counter = 2
+            module._simulated_anomaly_counter = 2
             module._ANOMALY_DECAY_LAST_TIME = 100.0
+            module._SIMULATED_ANOMALY_DECAY_LAST_TIME = 100.0
             module._ANOMALY_DECAY_WINDOW_SEC = 30.0
             module._KILL_SWITCH_TRIGGERED = False
             module._LAST_KILL_SWITCH_TRIGGER = 0.0
             with mock.patch.object(module, "execute_kill_switch") as kill_switch, \
                  mock.patch.object(module.time, "time", return_value=131.0):
+                # Under V3.2 Invariant I-06, dry_run=True decays _simulated_anomaly_counter without mutating production _anomaly_counter
                 self.assertFalse(module.evaluate_threat_state("eth0", True, score_a=0.96))
+                self.assertEqual(module._simulated_anomaly_counter, 1)
+                self.assertEqual(module._anomaly_counter, 2)
+                # Production dry_run=False decays production _anomaly_counter from 2 to 1
+                self.assertFalse(module.evaluate_threat_state("eth0", False, score_a=0.96))
                 self.assertEqual(module._anomaly_counter, 1)
                 kill_switch.assert_not_called()
         finally:
             module._anomaly_counter = original_counter
+            module._simulated_anomaly_counter = original_sim_counter
             if original_last_time is None:
                 delattr(module, "_ANOMALY_DECAY_LAST_TIME")
             else:
                 module._ANOMALY_DECAY_LAST_TIME = original_last_time
+            if original_sim_last_time is not None:
+                module._SIMULATED_ANOMALY_DECAY_LAST_TIME = original_sim_last_time
             if original_window is None:
                 delattr(module, "_ANOMALY_DECAY_WINDOW_SEC")
             else:

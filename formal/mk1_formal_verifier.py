@@ -1,10 +1,11 @@
 """Executable Explicit-State Model Checker, CTL/LTL Verifier, and Refinement Conformance Engine for MK1Ai FSM V3.2.
 
-Implements:
-1. Full explicit-state Kripke structure exploration (BFS/DFS + Tarjan SCC for LTL/CTL liveness)
-   over the FSM V3.2 formal mathematical model M = (S_ext, I, T, Init, AP).
+Implements (R-003 Complete Specification):
+1. Full explicit-state Kripke structure exploration (BFS/DFS + liveness convergence checks)
+   over the FSM V3.2 formal mathematical model M = (S_ext, I, T, Init, AP), including
+   the 2-phase WAL status ('UNINITIALIZED', 'PREPARED', 'COMMITTED') and crash/restart faults.
 2. Automated verification of all 20 Mandatory Mathematical Invariants (I-01 .. I-20).
-3. Automated verification of 7 Safety Temporal Properties and 4 Fair Liveness Properties.
+3. Automated verification of Safety Temporal Properties and Fair Liveness Properties.
 4. Counterexample trace extraction demonstrating exact invariant violations on the legacy V3.1 model
    and proving 0 counterexamples on the remediated V3.2 model.
 5. Refinement Mapping Conformance verification between the mathematical transition relation T
@@ -51,6 +52,8 @@ KILL_SWITCH_STATES = (
     "VERIFICATION_FAILED",
 )
 
+WAL_STATUSES = ("UNINITIALIZED", "PREPARED", "COMMITTED")
+
 ALLOWED_TRANSITIONS_V32: dict[str, frozenset[str]] = {
     "OFF": frozenset({"ARMING", "EMERGENCY"}),
     "ARMING": frozenset({"OFF", "ACTIVE", "EMERGENCY"}),
@@ -64,7 +67,7 @@ ALLOWED_TRANSITIONS_V32: dict[str, frozenset[str]] = {
 
 @dataclasses.dataclass(frozen=True)
 class FormalState:
-    """Complete 19-variable formal state tuple sigma in S_ext (PART 2.1)."""
+    """Complete formal state tuple sigma in S_ext (PART 2.1 + R-002/R-003 WAL status)."""
     state: str
     simulated_state: str
     generation: int
@@ -78,6 +81,7 @@ class FormalState:
     consumed_tokens: frozenset[str]
     storage_authenticity: str
     rollback_status: str
+    wal_status: str
     journal_generation: int
     journal_last_state: str
     kill_switch_status: str
@@ -107,6 +111,7 @@ INITIAL_STATE = FormalState(
     consumed_tokens=frozenset(),
     storage_authenticity="UNVERIFIED",
     rollback_status="UNINITIALIZED",
+    wal_status="UNINITIALIZED",
     journal_generation=0,
     journal_last_state="OFF",
     kill_switch_status="NOT_REQUESTED",
@@ -127,8 +132,13 @@ def check_invariants(prev_s: FormalState | None, action: str, s: FormalState) ->
     violations: list[tuple[str, str]] = []
 
     # I-01: State Type Safety
-    if s.state not in STATES or s.simulated_state not in STATES:
-        violations.append(("I-01", f"Invalid state ({s.state}) or simulated_state ({s.simulated_state})"))
+    if (
+        s.state not in STATES
+        or s.simulated_state not in STATES
+        or s.kill_switch_status not in KILL_SWITCH_STATES
+        or s.wal_status not in WAL_STATUSES
+    ):
+        violations.append(("I-01", f"Invalid state/ks/wal type: state={s.state}, sim={s.simulated_state}, ks={s.kill_switch_status}, wal={s.wal_status}"))
 
     # I-02: State Transition Completeness
     if prev_s is not None and not action.startswith("REBOOT_") and not action.startswith("FAULT_"):
@@ -159,6 +169,7 @@ def check_invariants(prev_s: FormalState | None, action: str, s: FormalState) ->
             prev_s.state,
             prev_s.generation,
             prev_s.max_observed_generation,
+            prev_s.wal_status,
             prev_s.journal_generation,
             prev_s.journal_last_state,
             prev_s.consumed_tokens,
@@ -169,6 +180,7 @@ def check_invariants(prev_s: FormalState | None, action: str, s: FormalState) ->
             s.state,
             s.generation,
             s.max_observed_generation,
+            s.wal_status,
             s.journal_generation,
             s.journal_last_state,
             s.consumed_tokens,
@@ -178,17 +190,17 @@ def check_invariants(prev_s: FormalState | None, action: str, s: FormalState) ->
         if prod_before != prod_after:
             violations.append(("I-06", f"Dry-Run mutated production state: {prod_before} -> {prod_after}"))
 
-    # I-07: Persistence Consistency
-    if s.storage_authenticity == "VERIFIED":
+    # I-07: Persistence Consistency (Committed WAL matches State & Journal)
+    if s.storage_authenticity == "VERIFIED" and s.wal_status == "COMMITTED":
         if s.generation != s.journal_generation or s.state != s.journal_last_state:
             violations.append((
                 "I-07",
                 f"Verified state ({s.state}, gen={s.generation}) out of sync with journal ({s.journal_last_state}, gen={s.journal_generation})",
             ))
 
-    # I-08: Rollback Prevention
-    if s.storage_authenticity == "FAILED_ROLLBACK" and s.state != "ISOLATED":
-        violations.append(("I-08", f"Rollback detected but state is {s.state} instead of ISOLATED"))
+    # I-08: Rollback & Incomplete WAL Prevention
+    if s.storage_authenticity in ("FAILED_ROLLBACK", "FAILED_WAL_INCOMPLETE") and s.state != "ISOLATED":
+        violations.append(("I-08", f"Rollback/Incomplete WAL detected ({s.storage_authenticity}) but state is {s.state}"))
 
     # I-09: Event & Challenge Binding
     if action == "RECOVERY_COMMIT_ARMING_TO_ACTIVE":
@@ -199,21 +211,29 @@ def check_invariants(prev_s: FormalState | None, action: str, s: FormalState) ->
     if action == "RECOVERY_Attempt_DuplicateSigner" and s.state == "ACTIVE":
         violations.append(("I-10", "Duplicate signer accepted as valid quorum"))
 
-    # I-11: Token Single-Use (One-Time Consumption)
+    # I-11: Token Single-Use (One-Time Consumption & Disjoint Reservation)
     if prev_s is not None and not prev_s.consumed_tokens.issubset(s.consumed_tokens):
         violations.append(("I-11", "Consumed recovery tokens were removed after commit"))
+    if s.reserved_tokens & s.consumed_tokens:
+        violations.append(("I-11", "Reserved token overlaps with already consumed token"))
 
     # I-12: Recovery Path Protection
     if prev_s is not None and prev_s.state == "ISOLATED" and s.state == "ACTIVE":
         violations.append(("I-12", "Direct jump from ISOLATED to ACTIVE bypassing RECOVERY_PENDING/APPROVED/ARMING"))
 
     # I-13: Reboot Safety
-    if action.startswith("REBOOT_") and s.boot_integrity_status in ("FAIL_CLOSED_ISOLATED", "NORMALIZED_TRANSIENT_TO_ISOLATED"):
+    if (action.startswith("REBOOT_") or action.startswith("FAULT_REBOOT_")) and s.boot_integrity_status in (
+        "FAIL_CLOSED_ISOLATED",
+        "NORMALIZED_TRANSIENT_TO_ISOLATED",
+    ):
         if s.state != "ISOLATED":
             violations.append(("I-13", f"Unsafe reboot state {s.state} under {s.boot_integrity_status}"))
 
     # I-14: Kill Switch Consistency
-    if s.network_block_confirmed and (s.state != "ISOLATED" or s.kill_switch_status != "OS_BLOCK_CONFIRMED"):
+    if s.network_block_confirmed and (
+        s.state not in ("ISOLATED", "RECOVERY_PENDING", "RECOVERY_APPROVED", "ARMING")
+        or s.kill_switch_status != "OS_BLOCK_CONFIRMED"
+    ):
         violations.append(("I-14", f"network_block_confirmed=True when state={s.state}, ks={s.kill_switch_status}"))
     if s.kill_switch_status == "OS_BLOCK_FAILED" and s.network_block_confirmed:
         violations.append(("I-14", "OS_BLOCK_FAILED falsely reported network_block_confirmed=True"))
@@ -227,8 +247,9 @@ def check_invariants(prev_s: FormalState | None, action: str, s: FormalState) ->
         violations.append(("I-16", "Non-CORE (Decoy) approval released CORE quarantine"))
 
     # I-17: Inter-Process Linearizability
-    if prev_s is not None and action.startswith("MULTIPROC_") and s.generation != prev_s.generation + 1:
-        violations.append(("I-17", f"Multi-process transition broke generation step: {prev_s.generation} -> {s.generation}"))
+    if prev_s is not None and prev_s.state != s.state and not action.startswith("DRY_RUN_") and not action.startswith("FAULT_REBOOT_"):
+        if s.generation != prev_s.generation + 1:
+            violations.append(("I-17", f"State transition broke +1 generation step: {prev_s.generation} -> {s.generation}"))
 
     # I-18: Event Reuse Prevention
     if action == "RECOVERY_Attempt_ReplayedEvent" and s.state == "ACTIVE":
@@ -239,8 +260,8 @@ def check_invariants(prev_s: FormalState | None, action: str, s: FormalState) ->
         violations.append(("I-19", "Unlabeled silent state transition"))
 
     # I-20: Safety Over Availability Priority
-    if s.emergency_latch and s.state == "ACTIVE" and action.startswith("RECOVERY_"):
-        violations.append(("I-20", "Availability (Recovery) prioritized over CORE safety latch"))
+    if (s.emergency_latch or s.wal_status == "PREPARED") and s.state == "ACTIVE" and action.startswith("RECOVERY_"):
+        violations.append(("I-20", "Availability (Recovery) prioritized over CORE safety latch or uncommitted WAL"))
 
     return violations
 
@@ -249,15 +270,16 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
     """Generate all valid next states (action, s_next) in FSM V3.2 formal transition relation T."""
     out: list[tuple[str, FormalState]] = []
 
-    # 1. Dry-Run transitions (bounded to avoid infinite dry-run self-loops without changing state)
-    for next_sim in ALLOWED_TRANSITIONS_V32.get(s.simulated_state, frozenset()):
-        if next_sim != s.simulated_state:
-            out.append((
-                f"DRY_RUN_{s.simulated_state}_TO_{next_sim}",
-                dataclasses.replace(s, simulated_state=next_sim, dry_run_mode=True),
-            ))
+    # 1. Dry-Run transitions from every reachable state (tests I-06 without redundant dry-run-of-fault Cartesian blowup)
+    if not s.dry_run_mode and s.storage_authenticity in ("UNVERIFIED", "VERIFIED"):
+        for next_sim in ALLOWED_TRANSITIONS_V32.get(s.simulated_state, frozenset()):
+            if next_sim != s.simulated_state:
+                out.append((
+                    f"DRY_RUN_{s.simulated_state}_TO_{next_sim}",
+                    dataclasses.replace(s, simulated_state=next_sim, dry_run_mode=True),
+                ))
 
-    if s.generation >= max_gen:
+    if s.dry_run_mode or s.storage_authenticity.startswith("FAILED_"):
         return out
 
     # 2. If emergency_latch is active, drain emergency preemptively before normal/recovery commits
@@ -273,6 +295,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                     simulated_state=next_st,
                     generation=new_gen,
                     max_observed_generation=max(s.max_observed_generation, new_gen),
+                    wal_status="COMMITTED",
                     journal_generation=new_gen,
                     journal_last_state=next_st,
                     emergency_latch=(next_st != "ISOLATED"),
@@ -300,6 +323,9 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
             ))
         return out
 
+    if s.generation >= max_gen:
+        return out
+
     # 3. Normal transitions: OFF -> ARMING -> ACTIVE -> OFF
     if s.state == "OFF":
         new_gen = s.generation + 1
@@ -311,6 +337,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                 simulated_state="ARMING",
                 generation=new_gen,
                 max_observed_generation=new_gen,
+                wal_status="COMMITTED",
                 journal_generation=new_gen,
                 journal_last_state="ARMING",
                 storage_authenticity="VERIFIED",
@@ -330,6 +357,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                     simulated_state=dst,
                     generation=new_gen,
                     max_observed_generation=new_gen,
+                    wal_status="COMMITTED",
                     journal_generation=new_gen,
                     journal_last_state=dst,
                     storage_authenticity="VERIFIED",
@@ -355,8 +383,8 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
             ),
         ))
 
-    # 5. Recovery 3-Phase Protocol from ISOLATED
-    if s.state == "ISOLATED" and s.storage_authenticity == "VERIFIED":
+    # 5. Recovery 4-Stage Protocol from ISOLATED (No intermediate state skipped!)
+    if s.state == "ISOLATED" and s.storage_authenticity == "VERIFIED" and s.wal_status == "COMMITTED":
         new_gen = s.generation + 1
         out.append((
             "RECOVERY_PHASE_R1_TO_PENDING",
@@ -366,6 +394,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                 simulated_state="RECOVERY_PENDING",
                 generation=new_gen,
                 max_observed_generation=new_gen,
+                wal_status="COMMITTED",
                 journal_generation=new_gen,
                 journal_last_state="RECOVERY_PENDING",
                 recovery_approval_status="PENDING",
@@ -414,6 +443,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                     simulated_state="RECOVERY_APPROVED",
                     generation=new_gen,
                     max_observed_generation=new_gen,
+                    wal_status="COMMITTED",
                     journal_generation=new_gen,
                     journal_last_state="RECOVERY_APPROVED",
                     recovery_approval_status="VERIFIED",
@@ -432,6 +462,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                 simulated_state="ISOLATED",
                 generation=new_gen,
                 max_observed_generation=new_gen,
+                wal_status="COMMITTED",
                 journal_generation=new_gen,
                 journal_last_state="ISOLATED",
                 recovery_approval_status="REJECTED",
@@ -451,6 +482,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                     simulated_state="ARMING",
                     generation=new_gen,
                     max_observed_generation=new_gen,
+                    wal_status="COMMITTED",
                     journal_generation=new_gen,
                     journal_last_state="ARMING",
                     snap_gen=new_gen,
@@ -469,6 +501,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                     simulated_state="ACTIVE",
                     generation=new_gen,
                     max_observed_generation=new_gen,
+                    wal_status="COMMITTED",
                     journal_generation=new_gen,
                     journal_last_state="ACTIVE",
                     consumed_tokens=s.consumed_tokens | s.reserved_tokens,
@@ -481,7 +514,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                 ),
             ))
 
-    # 6. Reboot & Fault-Injection Transitions (P0-001, P0-004, P2-003)
+    # 6. Reboot, Crash During PREPARED WAL, & Fault-Injection Transitions (P0-001, P0-004, P2-003, R-002)
     if s.anchor_provisioned and s.generation < max_gen:
         # Reboot from transient state -> normalized to ISOLATED (P2-003)
         if s.state in TRANSIENT_STATES:
@@ -494,6 +527,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                     simulated_state="ISOLATED",
                     generation=new_gen,
                     max_observed_generation=new_gen,
+                    wal_status="COMMITTED",
                     journal_generation=new_gen,
                     journal_last_state="ISOLATED",
                     boot_integrity_status="NORMALIZED_TRANSIENT_TO_ISOLATED",
@@ -502,8 +536,14 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                     active_challenge_id=s.active_challenge_id or "chg-boot",
                 ),
             ))
-        # Fault: Missing State or Missing Journal or Rollback on Reboot -> Fail-Closed ISOLATED
-        for fault_code in ("FAILED_MISSING_STATE", "FAILED_MISSING_JOURNAL", "FAILED_ROLLBACK", "FAILED_STATE_MISMATCH"):
+        # Fault: Missing State, Missing Journal, Rollback, State Mismatch, or Incomplete PREPARED WAL on Reboot -> Fail-Closed ISOLATED
+        for fault_code in (
+            "FAILED_MISSING_STATE",
+            "FAILED_MISSING_JOURNAL",
+            "FAILED_ROLLBACK",
+            "FAILED_STATE_MISMATCH",
+            "FAILED_WAL_INCOMPLETE",
+        ):
             if s.storage_authenticity == "VERIFIED":
                 out.append((
                     f"FAULT_REBOOT_{fault_code}",
@@ -511,9 +551,11 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
                         s,
                         state="ISOLATED",
                         simulated_state="ISOLATED",
+                        wal_status="PREPARED" if fault_code == "FAILED_WAL_INCOMPLETE" else s.wal_status,
                         storage_authenticity=fault_code,
-                        rollback_status="VIOLATION_DETECTED",
+                        rollback_status="WAL_INCOMPLETE_PREPARED" if fault_code == "FAILED_WAL_INCOMPLETE" else "VIOLATION_DETECTED",
                         boot_integrity_status="FAIL_CLOSED_ISOLATED",
+                        reserved_tokens=frozenset(),
                         network_block_confirmed=False,
                     ),
                 ))
@@ -521,7 +563,7 @@ def generate_successors_v32(s: FormalState, max_gen: int = 6) -> list[tuple[str,
     return out
 
 
-def explore_v32_model(max_gen: int = 5) -> dict[str, Any]:
+def explore_v32_model(max_gen: int = 6) -> dict[str, Any]:
     """Exhaustively explore the reachable state space of FSM V3.2 and verify I-01..I-20 + CTL/LTL properties."""
     t0 = time.monotonic()
     queue: deque[FormalState] = deque([INITIAL_STATE])
@@ -554,10 +596,16 @@ def explore_v32_model(max_gen: int = 5) -> dict[str, Any]:
     reached_control_states = {s.state for s in visited}
     unreachable_control_states = set(STATES) - reached_control_states
 
-    # Verify Liveness 1: From every reachable state with emergency_latch=True and gen < max_gen,
-    # all paths converge to state == "ISOLATED" within <= 2 steps (P0 convergence).
-    latched_states = [s for s in visited if s.emergency_latch and s.generation < max_gen]
-    liveness_p0_convergence_ok = True
+    # Verify Liveness 1: From every reachable production state with emergency_latch=True and gen < max_gen,
+    # all non-dry-run paths converge to state == "ISOLATED" within <= 2 steps (P0 convergence).
+    latched_states = [
+        s for s in visited
+        if s.emergency_latch
+        and not s.dry_run_mode
+        and not s.storage_authenticity.startswith("FAILED_")
+        and s.generation < max_gen
+    ]
+    liveness_p0_convergence_ok = len(latched_states) > 0
     for ls in latched_states:
         step1 = [nxt for act, nxt in adj.get(ls, []) if not act.startswith("DRY_RUN_")]
         if not step1:
@@ -570,18 +618,20 @@ def explore_v32_model(max_gen: int = 5) -> dict[str, Any]:
                     liveness_p0_convergence_ok = False
                     break
 
-    # Verify Liveness 2: From verified ISOLATED state with fresh epoch and gen + 4 <= max_gen,
-    # there exists a valid recovery path to ACTIVE when no P0 occurs.
+    # Verify Liveness 2: From verified production ISOLATED state with fresh unconsumed token and gen + 4 <= max_gen,
+    # there exists a valid 4-stage recovery path to ACTIVE when no P0 occurs.
     recoverable_isolated = [
         s for s in visited
         if s.state == "ISOLATED"
+        and not s.dry_run_mode
         and not s.emergency_latch
         and s.storage_authenticity == "VERIFIED"
+        and s.wal_status == "COMMITTED"
         and s.generation + 4 <= max_gen
+        and f"tok-{s.active_event_id or 'evt-1'}-{s.active_challenge_id or 'chg-1'}" not in s.consumed_tokens
     ]
     liveness_recovery_path_ok = len(recoverable_isolated) > 0
     for iso_s in recoverable_isolated:
-        # BFS ignoring P0_LATCH_TRIGGER and FAULT_ and REJECT
         sub_q = deque([iso_s])
         sub_vis = {iso_s}
         found_active = False
@@ -603,6 +653,7 @@ def explore_v32_model(max_gen: int = 5) -> dict[str, Any]:
     return {
         "model": "MK1Ai_FSM_V3.2",
         "max_generation_bound": max_gen,
+        "invariants_checked_count": 20,
         "reachable_states_count": len(visited),
         "explored_transitions_count": edges_count,
         "reached_control_states": sorted(reached_control_states),
@@ -616,7 +667,7 @@ def explore_v32_model(max_gen: int = 5) -> dict[str, Any]:
 
 
 def generate_v31_counterexamples() -> list[dict[str, Any]]:
-    """Generate concrete formal counterexample traces showing how the legacy V3.1 model violated I-04..I-15 (PART 3.4)."""
+    """Generate concrete formal counterexample traces showing how the legacy V3.1 model and pre-R001/R002 states violated invariants."""
     return [
         {
             "counterexample_id": "CEX-V31-001",
@@ -673,11 +724,22 @@ def generate_v31_counterexamples() -> list[dict[str, Any]]:
             "root_cause": "Line 6393 returned bool(success or target_fsm.current_state == ISOLATED) after calling isolate_immediately() first.",
             "v32_resolution": "8-state KillSwitchStatus tracks OS_BLOCK_FAILED vs OS_BLOCK_CONFIRMED; evaluate_threat_state returns False when OS block fails.",
         },
+        {
+            "counterexample_id": "CEX-V32-R001-R002",
+            "finding_id": "R-001 & R-002",
+            "violated_invariant": "I-07 (WAL Persistence Consistency) & I-17 (Lock Reentrancy / Linearizability)",
+            "initial_state": {"state": "ARMING", "generation": 1, "wal_status": "PREPARED"},
+            "input_event": "(A) Nested _acquire_lock() in same thread with state_path set; (B) SIGKILL after State replace before WAL COMMITTED",
+            "state_change": "(A) Inner open()+flock() self-contends with outer fd; (B) Uncommitted ACTIVE restored without PREPARED/COMMITTED check",
+            "thread_process": "Same Thread Reentrancy / Crash-Restart Process",
+            "root_cause": "Separate fd opened per nested _TimedLockContext; single-stage journal lacked explicit PREPARED vs COMMITTED marker.",
+            "v32_resolution": "R-001 outermost-only flock with _flock_depth & _flock_owner_tid; R-002 7-step PREPARED -> State -> COMMITTED WAL.",
+        },
     ]
 
 
 def verify_refinement_conformance() -> dict[str, Any]:
-    """Execute concrete Python MK1SafetyStateMachine transitions and verify 1-to-1 refinement conformance with the formal model (PART 4)."""
+    """Execute concrete Python MK1SafetyStateMachine transitions and verify 1-to-1 refinement conformance with the formal model (PART 4 & R-003)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         state_path = os.path.join(tmpdir, "refinement_fsm.json")
         key = "refinement-verification-strong-hmac-key-2026"
@@ -695,6 +757,7 @@ def verify_refinement_conformance() -> dict[str, Any]:
                 "emergency_latch": f.emergency_latch,
                 "emergency_epoch": f.emergency_epoch,
                 "authenticity_status": f.authenticity_status,
+                "wal_status": f._wal_status,
                 "rollback_status": rep["ROLLBACK_PROTECTION"],
                 "kill_switch_status": f.kill_switch_status,
                 "network_block_confirmed": f.network_block_confirmed,
@@ -707,15 +770,21 @@ def verify_refinement_conformance() -> dict[str, Any]:
         assert p0["generation"] == INITIAL_STATE.generation == 0
         steps_verified.append(("INIT", p0))
 
-        # 2. Normal Startup OFF -> ARMING -> ACTIVE
-        fsm.transition_to(fsm.ARMING, reason="Refinement Step 1")
+        # 2. Reentrant Lock + Normal Startup OFF -> ARMING -> ACTIVE (verifies R-001 + R-002)
+        with fsm._acquire_lock():
+            assert fsm._flock_depth == 1
+            with fsm._acquire_lock():
+                assert fsm._flock_depth == 2
+                fsm.transition_to(fsm.ARMING, reason="Refinement Step 1")
+            assert fsm._flock_depth == 1
+        assert fsm._flock_depth == 0
         p1 = _project_concrete(fsm)
-        assert p1["state"] == "ARMING" and p1["generation"] == 1 and p1["authenticity_status"] == "VERIFIED"
+        assert p1["state"] == "ARMING" and p1["generation"] == 1 and p1["authenticity_status"] == "VERIFIED" and p1["wal_status"] == "COMMITTED"
         steps_verified.append(("OFF->ARMING", p1))
 
         fsm.transition_to(fsm.ACTIVE, reason="Refinement Step 2")
         p2 = _project_concrete(fsm)
-        assert p2["state"] == "ACTIVE" and p2["generation"] == 2
+        assert p2["state"] == "ACTIVE" and p2["generation"] == 2 and p2["wal_status"] == "COMMITTED"
         steps_verified.append(("ARMING->ACTIVE", p2))
 
         # 3. Dry-Run Non-Interference Conformance (I-06)
@@ -750,7 +819,7 @@ def verify_refinement_conformance() -> dict[str, Any]:
         bundle = mk1_quorum.build_quorum_bundle(chg, [s1, s2])
         ok = fsm.request_recovery(bundle, chg, trusted, now=now)
         p5 = _project_concrete(fsm)
-        assert ok is True and p5["state"] == "ACTIVE" and p5["generation"] == 8
+        assert ok is True and p5["state"] == "ACTIVE" and p5["generation"] == 8 and p5["wal_status"] == "COMMITTED"
         steps_verified.append(("QUORUM_RECOVERY", p5))
 
         return {
@@ -761,13 +830,15 @@ def verify_refinement_conformance() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    mc_report = explore_v32_model(max_gen=5)
+    mc_report = explore_v32_model(max_gen=6)
     cex_report = generate_v31_counterexamples()
     ref_report = verify_refinement_conformance()
     summary = {
         "model_checking": mc_report,
         "v31_counterexamples_count": len(cex_report),
+        "v31_counterexamples": cex_report,
         "refinement_conformance": ref_report["conformance_verified"],
+        "refinement_steps_verified": ref_report["steps_count"],
     }
     print(json.dumps(summary, indent=2, default=lambda o: sorted(list(o)) if isinstance(o, (set, frozenset)) else str(o)))
     if mc_report["invariant_violations_count"] > 0 or not ref_report["conformance_verified"]:

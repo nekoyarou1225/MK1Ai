@@ -39,6 +39,7 @@ class TestV3FinalRemediation(unittest.TestCase):
 
     def tearDown(self):
         self._ks_patcher.stop()
+        defender.toggle_oni_mode(False)
         defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
         defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
         defender._SAFETY_FSM._save_persistent_state()

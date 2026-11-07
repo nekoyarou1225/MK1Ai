@@ -17,6 +17,7 @@ class TestV3Remediation(unittest.TestCase):
         defender._ISOLATION_APPROVAL_PENDING = False
 
     def tearDown(self):
+        defender.toggle_oni_mode(False)
         defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
         defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
         defender._SAFETY_FSM._save_persistent_state()

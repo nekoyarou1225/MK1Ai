@@ -62,6 +62,7 @@ class TestFSMV32UltimateVerification(unittest.TestCase):
         defender._ISOLATION_APPROVAL_PENDING = False
 
     def tearDown(self):
+        defender.toggle_oni_mode(False)
         defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
         defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
         defender._SAFETY_FSM._save_persistent_state()
@@ -439,7 +440,7 @@ class TestFSMV32UltimateVerification(unittest.TestCase):
 
     def test_formal_model_checking_and_refinement_conformance(self):
         """Verify 0 invariant violations across reachable state space for I-01..I-20 and 1-to-1 refinement conformance."""
-        mc = mk1_formal_verifier.explore_v32_model(max_gen=5)
+        mc = mk1_formal_verifier.explore_v32_model(max_gen=6)
         self.assertEqual(mc["invariant_violations_count"], 0)
         self.assertEqual(mc["unreachable_control_states"], [])
         self.assertTrue(mc["liveness_p0_convergence_verified"])
@@ -736,6 +737,450 @@ class TestFSMV32UltimateVerification(unittest.TestCase):
 
         self.assertEqual(len(killed_mutants), 7, f"Expected all 7 mutants killed, got {killed_mutants}")
 
+    # =========================================================================
+    # R-001: fcntl.flock Reentrancy & Nested Lock Verification
+    # =========================================================================
+
+    def test_r001_reentrant_flock_nested_16_threads_and_timeout(self):
+        """R-001: Same-thread nested _acquire_lock() with state_path set never self-deadlocks; 16-thread nested lock stress and cross-thread/process lock timeouts work."""
+        p = os.path.join(self.temp_dir.name, "r001", "fsm.json")
+        fsm = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key, lock_timeout_sec=1.0)
+        fsm.transition_to(fsm.ARMING)
+        fsm.transition_to(fsm.ACTIVE)
+
+        # 1. 3-level nested lock acquisition in the same thread with state_path configured
+        self.assertEqual(fsm._flock_depth, 0)
+        with fsm._acquire_lock():
+            self.assertEqual(fsm._flock_depth, 1)
+            outer_fd = fsm._flock_fd
+            self.assertIsNotNone(outer_fd)
+            with fsm._acquire_lock():
+                self.assertEqual(fsm._flock_depth, 2)
+                self.assertEqual(fsm._flock_fd, outer_fd)
+                with fsm._acquire_lock():
+                    self.assertEqual(fsm._flock_depth, 3)
+                    self.assertEqual(fsm._flock_fd, outer_fd)
+                    self.assertTrue(
+                        fsm.isolate_immediately(
+                            reason="Nested R-001",
+                            event_id="evt-r001-nested",
+                            challenge_id="chg-r001-nested",
+                        )
+                    )
+                self.assertEqual(fsm._flock_depth, 2)
+            self.assertEqual(fsm._flock_depth, 1)
+        self.assertEqual(fsm._flock_depth, 0)
+        self.assertIsNone(fsm._flock_fd)
+        self.assertIsNone(fsm._flock_owner_tid)
+        self.assertEqual(fsm.current_state, fsm.ISOLATED)
+
+        # 2. 16-thread nested lock stress test
+        barrier = threading.Barrier(16)
+        nested_errors = []
+
+        def _nested_worker(tid: int):
+            try:
+                barrier.wait(timeout=5.0)
+                with fsm._acquire_lock():
+                    with fsm._acquire_lock():
+                        fsm.isolate_immediately(
+                            reason=f"Nested-16T-{tid}",
+                            event_id=f"evt-r001-{tid}",
+                            challenge_id=f"chg-r001-{tid}",
+                        )
+            except Exception as exc:
+                nested_errors.append(exc)
+
+        threads = [threading.Thread(target=_nested_worker, args=(i,), daemon=True) for i in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(nested_errors, [])
+        self.assertEqual(fsm._flock_depth, 0)
+
+        # 3. Lock timeout test across threads when lock is held
+        fsm_short = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key, lock_timeout_sec=0.05)
+        hold_ready = threading.Event()
+        release_hold = threading.Event()
+
+        def _holder():
+            with fsm_short._acquire_lock():
+                hold_ready.set()
+                release_hold.wait(timeout=2.0)
+
+        ht = threading.Thread(target=_holder, daemon=True)
+        ht.start()
+        self.assertTrue(hold_ready.wait(timeout=1.0))
+        try:
+            with self.assertRaises(TimeoutError):
+                with fsm_short._acquire_lock():
+                    pass
+        finally:
+            release_hold.set()
+            ht.join(timeout=1.0)
+
+    # =========================================================================
+    # R-002: 2-Phase WAL PREPARED / COMMITTED & Crash / Fault Injection
+    # =========================================================================
+
+    def test_r002_two_phase_wal_7_steps_and_crash_fault_injection(self):
+        """R-002: Verify 7-step PREPARED/COMMITTED WAL protocol and confirm SIGKILL/write/replace/fsync faults at any step never restore ACTIVE."""
+        # 1. Verify step sequence during normal transition
+        p_steps = os.path.join(self.temp_dir.name, "r002_steps", "fsm.json")
+        observed_steps = []
+        fsm = MK1SafetyStateMachine(state_path=p_steps, hmac_key=self.hmac_key)
+        fsm._wal_fault_hook = lambda stage: observed_steps.append(stage)
+        fsm.transition_to(fsm.ARMING)
+        self.assertEqual(
+            observed_steps,
+            [
+                "AFTER_PREPARED_FSYNC",
+                "BEFORE_STATE_FSYNC",
+                "BEFORE_STATE_REPLACE",
+                "AFTER_STATE_REPLACE_BEFORE_COMMITTED",
+                "BEFORE_FINAL_VERIFICATION",
+            ],
+        )
+        with open(fsm.journal_path, "r", encoding="utf-8") as jf:
+            jrec = json.load(jf)
+        self.assertEqual(jrec["status"], "COMMITTED")
+
+        # 2. Real SIGKILL (kill -9) in subprocess right at AFTER_PREPARED_FSYNC during recovery to ACTIVE
+        p_kill = os.path.join(self.temp_dir.name, "r002_sigkill", "fsm.json")
+        fsm_init = MK1SafetyStateMachine(state_path=p_kill, hmac_key=self.hmac_key)
+        fsm_init.transition_to(fsm_init.ARMING)
+        fsm_init.transition_to(fsm_init.ACTIVE)
+        fsm_init.isolate_immediately(reason="Pre-Crash P0", event_id="evt-wal-1", challenge_id="chg-wal-1")
+
+        kill_code = (
+            "import os, signal, airgap_ai_defender as d\n"
+            f"fsm = d.MK1SafetyStateMachine(state_path={p_kill!r}, hmac_key={self.hmac_key!r})\n"
+            "fsm._state = fsm.ARMING\n"
+            "def _crash_hook(stage):\n"
+            "    if stage == 'AFTER_PREPARED_FSYNC':\n"
+            "        os.kill(os.getpid(), signal.SIGKILL)\n"
+            "fsm._wal_fault_hook = _crash_hook\n"
+            "fsm.transition_to(fsm.ACTIVE, reason='Crash during WAL to ACTIVE')\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", kill_code], capture_output=True, text=True)
+        self.assertLess(proc.returncode, 0, "Subprocess must be terminated by SIGKILL")
+
+        # Inspect journal on disk: must be PREPARED for ACTIVE
+        with open(fsm_init.journal_path, "r", encoding="utf-8") as jf:
+            crashed_journal = json.load(jf)
+        self.assertEqual(crashed_journal["status"], "PREPARED")
+        self.assertEqual(crashed_journal["last_state"], "ACTIVE")
+
+        # Reboot from crashed PREPARED WAL: MUST NOT restore ACTIVE; must Fail-Closed to ISOLATED
+        recovered_after_sigkill = MK1SafetyStateMachine(state_path=p_kill, hmac_key=self.hmac_key)
+        self.assertEqual(recovered_after_sigkill.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(recovered_after_sigkill.authenticity_status, "FAILED_WAL_INCOMPLETE")
+        self.assertEqual(recovered_after_sigkill.rollback_protection_status, "WAL_INCOMPLETE_PREPARED")
+
+        # 3. Crash at AFTER_STATE_REPLACE_BEFORE_COMMITTED (state file already says ACTIVE, journal still says PREPARED)
+        p_mid = os.path.join(self.temp_dir.name, "r002_mid", "fsm.json")
+        fsm_mid = MK1SafetyStateMachine(state_path=p_mid, hmac_key=self.hmac_key)
+        fsm_mid.transition_to(fsm_mid.ARMING)
+
+        def _abort_before_commit(stage: str):
+            if stage == "AFTER_STATE_REPLACE_BEFORE_COMMITTED":
+                raise OSError("Simulated crash after state os.replace but before journal COMMITTED")
+
+        fsm_mid._wal_fault_hook = _abort_before_commit
+        fsm_mid._state = fsm_mid.ACTIVE
+        fsm_mid._generation += 1
+        fsm_mid._save_persistent_state()
+        self.assertEqual(fsm_mid.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(fsm_mid.authenticity_status, "FAILED_PERSISTENCE")
+
+        # Even when reloading from disk where state file has ACTIVE and journal has PREPARED, reboot must Fail-Closed to ISOLATED
+        reloaded_mid = MK1SafetyStateMachine(state_path=p_mid, hmac_key=self.hmac_key)
+        self.assertEqual(reloaded_mid.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(reloaded_mid.authenticity_status, "FAILED_WAL_INCOMPLETE")
+
+        # 4. Fault injection on os.replace and os.fsync
+        for fault_target in ("os.replace", "os.fsync"):
+            p_flt = os.path.join(self.temp_dir.name, f"r002_{fault_target.replace('.', '_')}", "fsm.json")
+            fsm_flt = MK1SafetyStateMachine(state_path=p_flt, hmac_key=self.hmac_key)
+            fsm_flt.transition_to(fsm_flt.ARMING)
+            with mock.patch(fault_target, side_effect=OSError(f"Simulated {fault_target} failure")):
+                fsm_flt._state = fsm_flt.ACTIVE
+                fsm_flt._generation += 1
+                fsm_flt._save_persistent_state()
+            self.assertEqual(fsm_flt.current_state, MK1SafetyStateMachine.ISOLATED)
+            self.assertEqual(fsm_flt.authenticity_status, "FAILED_PERSISTENCE")
+
+    # =========================================================================
+    # R-004: Additional Concurrency, Fault Injection, and Boundary Verification
+    # =========================================================================
+
+    def test_r004_01_16_threads_concurrent_recovery_exactly_one_succeeds(self):
+        """R-004 (1): 16 threads simultaneously calling request_recovery on the same isolated event results in 1 success and 15 rejections."""
+        p = os.path.join(self.temp_dir.name, "r004_16rec", "fsm.json")
+        fsm = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key, lock_timeout_sec=5.0)
+        fsm.transition_to(fsm.ARMING)
+        fsm.transition_to(fsm.ACTIVE)
+        fsm.isolate_immediately(reason="P0 for 16T recovery", event_id="evt-16rec", challenge_id="chg-16rec")
+
+        trusted, chg, bundle, _ = self._build_valid_quorum(event_id="evt-16rec", challenge_id="chg-16rec")
+        barrier = threading.Barrier(16)
+        outcomes = []
+        outcomes_lock = threading.Lock()
+
+        def _rec_thread():
+            barrier.wait(timeout=5.0)
+            ok = fsm.request_recovery(bundle, chg, trusted)
+            with outcomes_lock:
+                outcomes.append(ok)
+
+        threads = [threading.Thread(target=_rec_thread, daemon=True) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual(len(outcomes), 16)
+        self.assertEqual(outcomes.count(True), 1, f"Expected exactly 1 recovery to succeed, got {outcomes}")
+        self.assertEqual(outcomes.count(False), 15)
+        self.assertEqual(fsm.current_state, fsm.ACTIVE)
+
+    def test_r004_02_p0_emergency_vs_persistence_io_delay_contention(self):
+        """R-004 (2): P0 emergency isolation contending with slow persistence I/O completes deterministically into ISOLATED."""
+        p = os.path.join(self.temp_dir.name, "r004_iodelay", "fsm.json")
+        fsm = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key, lock_timeout_sec=2.0)
+        fsm.transition_to(fsm.ARMING)
+        fsm._persistence_io_delay_sec = 0.03
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def _slow_arming_to_active():
+            barrier.wait(timeout=2.0)
+            try:
+                fsm.transition_to(fsm.ACTIVE, reason="Slow persistence transition")
+                results["t1"] = True
+            except RuntimeError:
+                results["t1"] = False
+
+        def _urgent_p0():
+            barrier.wait(timeout=2.0)
+            time.sleep(0.005)
+            results["p0"] = fsm.isolate_immediately(
+                reason="Urgent P0 during I/O delay",
+                event_id="evt-io-p0",
+                challenge_id="chg-io-p0",
+            )
+
+        t1 = threading.Thread(target=_slow_arming_to_active, daemon=True)
+        t2 = threading.Thread(target=_urgent_p0, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+        fsm._persistence_io_delay_sec = 0.0
+
+        self.assertTrue(results.get("p0"))
+        self.assertEqual(fsm.current_state, fsm.ISOLATED)
+        self.assertEqual(fsm.authenticity_status, "VERIFIED")
+
+    def test_r004_03_kill_switch_failure_vs_recovery_contention(self):
+        """R-004 (3): Kill Switch OS failure occurring concurrently with Recovery preempts recovery, locks FSM in ISOLATED, and reports OS_BLOCK_FAILED."""
+        p = os.path.join(self.temp_dir.name, "r004_ks_rec", "fsm.json")
+        fsm = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key, lock_timeout_sec=2.0)
+        fsm.transition_to(fsm.ARMING)
+        fsm.transition_to(fsm.ACTIVE)
+        fsm.isolate_immediately(reason="Init P0", event_id="evt-ks-rec", challenge_id="chg-ks-rec")
+
+        trusted, chg, bundle, _ = self._build_valid_quorum(event_id="evt-ks-rec", challenge_id="chg-ks-rec")
+        fsm._recovery_verification_delay_sec = 0.05
+        barrier = threading.Barrier(2)
+        res = {}
+
+        def _run_rec():
+            barrier.wait(timeout=2.0)
+            res["rec"] = fsm.request_recovery(bundle, chg, trusted)
+
+        def _run_p0_ks_fail():
+            barrier.wait(timeout=2.0)
+            time.sleep(0.01)
+            defender._LAST_KILL_SWITCH_TRIGGER = 0.0
+            with mock.patch.object(defender, "execute_kill_switch", return_value=False):
+                res["eval"] = defender.evaluate_threat_state(
+                    interface="eth0",
+                    dry_run=False,
+                    score_a=0.995,
+                    autonomous=True,
+                    fsm=fsm,
+                )
+
+        t1 = threading.Thread(target=_run_rec, daemon=True)
+        t2 = threading.Thread(target=_run_p0_ks_fail, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+
+        self.assertFalse(res["rec"], "Recovery must be preempted by P0 threat evaluation")
+        self.assertFalse(res["eval"], "Kill Switch failure must never return True")
+        self.assertEqual(fsm.current_state, fsm.ISOLATED)
+        self.assertEqual(fsm.kill_switch_status, fsm.KS_OS_BLOCK_FAILED)
+        self.assertFalse(fsm.network_block_confirmed)
+
+    def test_r004_04_sigkill_process_restart_preserves_isolated(self):
+        """R-004 (4): Child process isolates FSM and receives SIGKILL (kill -9); subsequent process restart remains ISOLATED."""
+        p = os.path.join(self.temp_dir.name, "r004_sigkill_boot", "fsm.json")
+        child_script = (
+            "import os, signal, airgap_ai_defender as d\n"
+            f"fsm = d.MK1SafetyStateMachine(state_path={p!r}, hmac_key={self.hmac_key!r})\n"
+            "fsm.transition_to(fsm.ARMING)\n"
+            "fsm.transition_to(fsm.ACTIVE)\n"
+            "fsm.isolate_immediately(reason='SIGKILL survival test', event_id='evt-kill9', challenge_id='chg-kill9')\n"
+            "os.kill(os.getpid(), signal.SIGKILL)\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", child_script], capture_output=True, text=True)
+        self.assertLess(proc.returncode, 0)
+
+        restarted = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+        self.assertEqual(restarted.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(restarted.authenticity_status, "VERIFIED")
+        self.assertEqual(restarted.generation, 4)
+
+    def test_r004_05_old_generation_overwrite_attack_detected(self):
+        """R-004 (5): Overwriting state file (or both state + journal) with a captured older ACTIVE generation is caught fail-closed."""
+        p = os.path.join(self.temp_dir.name, "r004_rollback", "fsm.json")
+        fsm = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+        fsm.transition_to(fsm.ARMING)
+        fsm.transition_to(fsm.ACTIVE)
+        self.assertEqual(fsm.generation, 2)
+
+        # Save snapshot of valid ACTIVE state and journal at generation=2
+        snap_state = p + ".gen2.bak"
+        snap_journal = fsm.journal_path + ".gen2.bak"
+        shutil.copy2(p, snap_state)
+        shutil.copy2(fsm.journal_path, snap_journal)
+
+        # Advance to ISOLATED at generation=4
+        fsm.isolate_immediately(reason="Advance to gen 4")
+        self.assertEqual(fsm.generation, 4)
+
+        # Attack A: Overwrite state file with gen=2 ACTIVE snapshot while journal is gen=4
+        shutil.copy2(snap_state, p)
+        reloaded_a = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+        self.assertEqual(reloaded_a.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(reloaded_a.authenticity_status, "FAILED_ROLLBACK")
+        self.assertEqual(reloaded_a.rollback_protection_status, "ROLLBACK_DETECTED")
+
+        # Attack B: Overwrite BOTH state file and journal file with gen=2 ACTIVE snapshot (Boot Anchor catches it)
+        shutil.copy2(snap_state, p)
+        shutil.copy2(snap_journal, fsm.journal_path)
+        reloaded_b = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+        self.assertEqual(reloaded_b.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(reloaded_b.authenticity_status, "FAILED_ROLLBACK")
+        self.assertEqual(reloaded_b.rollback_protection_status, "ANCHOR_ROLLBACK_DETECTED")
+
+    def test_r004_06_enospc_and_erofs_filesystem_faults_fail_closed(self):
+        """R-004 (6): ENOSPC (disk full) and EROFS (read-only filesystem) during persistence fail closed to ISOLATED."""
+        import errno
+
+        for err_code, err_msg in ((errno.ENOSPC, "No space left on device"), (errno.EROFS, "Read-only file system")):
+            p = os.path.join(self.temp_dir.name, f"r004_err_{err_code}", "fsm.json")
+            fsm = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+            fsm.transition_to(fsm.ARMING)
+            with mock.patch("os.replace", side_effect=OSError(err_code, err_msg)):
+                fsm._state = fsm.ACTIVE
+                fsm._generation += 1
+                fsm._save_persistent_state()
+            self.assertEqual(fsm.current_state, MK1SafetyStateMachine.ISOLATED)
+            self.assertEqual(fsm.authenticity_status, "FAILED_PERSISTENCE")
+
+    def test_r004_07_network_block_verification_failed_and_partial_states(self):
+        """R-004 (7): Network block verification failure or exception sets KS_VERIFICATION_FAILED and network_block_confirmed=False."""
+        p = os.path.join(self.temp_dir.name, "r004_netverify", "fsm.json")
+        fsm = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+        fsm.transition_to(fsm.ARMING)
+        fsm.transition_to(fsm.ACTIVE)
+
+        # Verifier returns False -> KS_VERIFICATION_FAILED
+        defender._LAST_KILL_SWITCH_TRIGGER = 0.0
+        fsm._network_block_verifier = lambda iface: False
+        with mock.patch.object(defender, "execute_kill_switch", return_value=True):
+            ok = defender.evaluate_threat_state("eth0", False, score_a=0.99, autonomous=True, fsm=fsm)
+        self.assertFalse(ok)
+        self.assertEqual(fsm.current_state, fsm.ISOLATED)
+        self.assertEqual(fsm.kill_switch_status, fsm.KS_VERIFICATION_FAILED)
+        self.assertFalse(fsm.network_block_confirmed)
+
+        # Verifier raises RuntimeError -> KS_VERIFICATION_FAILED
+        defender._LAST_KILL_SWITCH_TRIGGER = 0.0
+
+        def _raising_verifier(iface: str):
+            raise RuntimeError("nftables probe failed")
+
+        fsm._network_block_verifier = _raising_verifier
+        with mock.patch.object(defender, "execute_kill_switch", return_value=True):
+            ok_exc = defender.evaluate_threat_state("eth0", False, score_a=0.99, autonomous=True, fsm=fsm)
+        self.assertFalse(ok_exc)
+        self.assertEqual(fsm.kill_switch_status, fsm.KS_VERIFICATION_FAILED)
+        self.assertFalse(fsm.network_block_confirmed)
+
+    def test_r004_08_clock_skew_boundary_conditions(self):
+        """R-004 (8): Exact boundary verification for clock skew (+300s, +301s, -1s, issued_at > now, expires_at < now)."""
+        p = os.path.join(self.temp_dir.name, "r004_clock", "fsm.json")
+        fsm = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+        fsm.transition_to(fsm.ARMING)
+        fsm.transition_to(fsm.ACTIVE)
+        fsm.isolate_immediately(reason="Clock boundary test", event_id="evt-clk", challenge_id="chg-clk")
+
+        now_ts = 1_750_000_000
+        trusted, base_chg, _, (op1, op2, _) = self._build_valid_quorum(
+            event_id="evt-clk", challenge_id="chg-clk", issued_at=now_ts, ttl_sec=300
+        )
+
+        def _resign(chg_doc: dict):
+            s1 = mk1_quorum.sign_quorum_challenge(chg_doc, operator_id="admin_1", private_key_pem=op1["private_key_pem"])
+            s2 = mk1_quorum.sign_quorum_challenge(chg_doc, operator_id="admin_2", private_key_pem=op2["private_key_pem"])
+            return mk1_quorum.build_quorum_bundle(chg_doc, [s1, s2])
+
+        # 1. issued_at == now + 1 (1s in the future, i.e., clock skew -1s relative to issuer) -> Rejected (I-09: issued_at <= now)
+        chg_future_1s = copy.deepcopy(base_chg)
+        chg_future_1s["issued_at"] = now_ts + 1
+        self.assertFalse(fsm.request_recovery(_resign(chg_future_1s), chg_future_1s, trusted, now=now_ts))
+
+        # 2. now == expires_at + 1 (expired by 1s, i.e., +301s after issued_at) -> Rejected (I-09: now <= expires_at)
+        self.assertFalse(fsm.request_recovery(_resign(base_chg), base_chg, trusted, now=now_ts + 301))
+
+        # 3. now == expires_at (exact +300s boundary) -> Accepted (I-09: issued_at <= now <= expires_at)
+        self.assertTrue(fsm.request_recovery(_resign(base_chg), base_chg, trusted, now=now_ts + 300))
+        self.assertEqual(fsm.current_state, fsm.ACTIVE)
+
+        # 4. State file timestamp clock skew boundary (+299s accepted vs +301s rejected)
+        real_now = time.time()
+        with open(p, "r", encoding="utf-8") as f:
+            sdata = json.load(f)
+
+        # +299s within 300s max future skew -> VERIFIED
+        ts_ok = real_now + 299.0
+        sdata["timestamp"] = ts_ok
+        sdata["integrity"] = fsm._compute_integrity(sdata["state"], ts_ok, sdata["generation"])
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(sdata, f)
+        reloaded_ok = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+        self.assertEqual(reloaded_ok.current_state, MK1SafetyStateMachine.ACTIVE)
+        self.assertEqual(reloaded_ok.authenticity_status, "VERIFIED")
+
+        # +301s beyond 300s max future skew -> Rejected (FAILED_LOAD -> ISOLATED)
+        ts_bad = real_now + 301.0
+        sdata["timestamp"] = ts_bad
+        sdata["integrity"] = fsm._compute_integrity(sdata["state"], ts_bad, sdata["generation"])
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(sdata, f)
+        reloaded_bad = MK1SafetyStateMachine(state_path=p, hmac_key=self.hmac_key)
+        self.assertEqual(reloaded_bad.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(reloaded_bad.authenticity_status, "FAILED_LOAD")
+
 
 if __name__ == "__main__":
     unittest.main()
+

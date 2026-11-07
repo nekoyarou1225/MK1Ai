@@ -11,9 +11,18 @@ class TestV2Remediation(unittest.TestCase):
         defender.toggle_oni_mode(False)
         # Use _state to bypass transition rules for setup if necessary, or use valid transitions
         defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._save_persistent_state()
         defender._KILL_SWITCH_TRIGGERED = False
         defender._anomaly_counter = 0
+        defender._simulated_anomaly_counter = 0
         defender._ISOLATION_APPROVAL_PENDING = False
+
+    def tearDown(self):
+        defender.toggle_oni_mode(False)
+        defender._SAFETY_FSM._state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._simulated_state = MK1SafetyStateMachine.ACTIVE
+        defender._SAFETY_FSM._save_persistent_state()
 
     def test_fsm_basic_transitions(self):
         fsm = defender._SAFETY_FSM
@@ -33,8 +42,8 @@ class TestV2Remediation(unittest.TestCase):
         # High confidence P0 threat
         score_a = 0.995 
         
-        # In V3, a single 0.995 score A is P0 and triggers autonomous isolation immediately if autonomous=True
-        # We use dry_run=True to avoid sub-process command execution errors in sandbox
+        # In V3.2 (P0-002 / Invariant I-06), dry_run=True isolates simulated_state
+        # without contaminating production current_state.
         defender.evaluate_threat_state(
             interface="eth0", 
             dry_run=True, 
@@ -42,16 +51,28 @@ class TestV2Remediation(unittest.TestCase):
             autonomous=True
         )
         
-        # It should have reached ISOLATED
-        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ISOLATED)
+        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ACTIVE)
+        self.assertEqual(defender._SAFETY_FSM.simulated_state, MK1SafetyStateMachine.ISOLATED)
 
     def test_non_autonomous_requires_quorum(self):
         # High confidence threat but autonomous=False
         score_a = 0.995 
         
-        triggered = defender.evaluate_threat_state(
+        # Under V3.2 Invariant I-06, dry_run=True does not mutate production _ISOLATION_APPROVAL_PENDING
+        triggered_dry = defender.evaluate_threat_state(
             interface="eth0", 
             dry_run=True, 
+            score_a=score_a, 
+            autonomous=False
+        )
+        self.assertTrue(triggered_dry)
+        self.assertEqual(defender._SAFETY_FSM.current_state, MK1SafetyStateMachine.ACTIVE)
+        self.assertFalse(defender._ISOLATION_APPROVAL_PENDING)
+
+        # Production dry_run=False with autonomous=False sets _ISOLATION_APPROVAL_PENDING=True without isolating
+        triggered = defender.evaluate_threat_state(
+            interface="eth0", 
+            dry_run=False, 
             score_a=score_a, 
             autonomous=False
         )
