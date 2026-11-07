@@ -43,7 +43,8 @@ AuthStatuses == {
     "UNVERIFIED", "VERIFIED", "FAILED_HMAC", "FAILED_ROLLBACK",
     "FAILED_MISSING_STATE", "FAILED_MISSING_JOURNAL", "FAILED_STORAGE_WIPE",
     "FAILED_STATE_MISMATCH", "FAILED_JOURNAL_DESYNC", "FAILED_PERSISTENCE",
-    "FAILED_WAL_INCOMPLETE", "FAILED_LOAD", "FAILED_SCHEMA", "FAILED_KEY_SECURITY"
+    "FAILED_WAL_INCOMPLETE", "FAILED_LOAD", "FAILED_SCHEMA", "FAILED_KEY_SECURITY",
+    "FAILED_SEAL_MISSING", "FAILED_SEAL_TAMPER", "FAILED_ANCHOR_MISSING", "FAILED_ANCHOR_DESYNC"
 }
 
 VARIABLES
@@ -75,7 +76,10 @@ VARIABLES
     prev_state,               \* 26. Previous control state for step invariant verification
     prev_generation,          \* 27. Previous generation for monotonicity verification
     snap_recovery_epoch,      \* 28. Snapshot of emergency_epoch at recovery Phase R1
-    snap_recovery_gen         \* 29. Snapshot of generation across recovery stages
+    snap_recovery_gen,         \* 29. Snapshot of generation across recovery stages
+    deterministic_danger,     \* 30. Layer B (IMSE) danger detection
+    ai_corrupted              \* 31. Layer A (AI-TIE) data corruption indicator
+
 
 vars == <<
     state, simulated_state, generation, max_observed_generation,
@@ -84,7 +88,9 @@ vars == <<
     storage_authenticity, rollback_status, wal_status, journal_generation, journal_last_state,
     kill_switch_status, network_block_confirmed, dry_run_mode, process_identity,
     boot_integrity_status, domain_tag, quorum_distinct_signers, last_action,
-    prev_state, prev_generation, snap_recovery_epoch, snap_recovery_gen
+    prev_state, prev_generation, snap_recovery_epoch, snap_recovery_gen,
+    deterministic_danger, ai_corrupted
+
 >>
 
 AllowedTransitions(s) ==
@@ -127,6 +133,9 @@ Init ==
     /\ prev_generation = 0
     /\ snap_recovery_epoch = 0
     /\ snap_recovery_gen = 0
+    /\ deterministic_danger = FALSE
+    /\ ai_corrupted = FALSE
+
 
 \* -------------------------------------------------------------------------
 \* 1. Normal Startup & Operational Transitions: OFF -> ARMING -> ACTIVE -> OFF
@@ -155,8 +164,10 @@ NormalTransition(next_s) ==
         policy_version, recovery_approval_status, reserved_tokens, consumed_tokens,
         kill_switch_status, network_block_confirmed, process_identity,
         boot_integrity_status, domain_tag, quorum_distinct_signers,
-        snap_recovery_epoch, snap_recovery_gen
+        snap_recovery_epoch, snap_recovery_gen,
+        deterministic_danger, ai_corrupted
        >>
+
 
 \* -------------------------------------------------------------------------
 \* 2. Atomic P0 Emergency Preemption Latch & Drain (OFF/ARMING/ACTIVE/RECOVERY -> EMERGENCY -> ISOLATED)
@@ -164,7 +175,9 @@ NormalTransition(next_s) ==
 TriggerEmergencyLatch(evt, chg) ==
     /\ evt \in ValidEvents
     /\ chg \in ValidChallenges
-    /\ emergency_epoch < MaxGen
+    /\ emergency_epoch < 2
+    /\ generation + 2 <= MaxGen
+    /\ state /= "ISOLATED"
     /\ prev_state' = state
     /\ prev_generation' = generation
     /\ emergency_latch' = TRUE
@@ -213,8 +226,10 @@ DrainEmergencyStep ==
            emergency_epoch, active_event_id, active_challenge_id,
            policy_version, consumed_tokens, process_identity,
            boot_integrity_status, domain_tag, quorum_distinct_signers,
-           snap_recovery_epoch, snap_recovery_gen
+           snap_recovery_epoch, snap_recovery_gen,
+           deterministic_danger, ai_corrupted
           >>
+
 
 \* -------------------------------------------------------------------------
 \* 3. Full 4-Stage M-of-N Recovery Protocol (No Intermediate State Omitted!)
@@ -457,11 +472,13 @@ CrashAndRebootFromTransient ==
     /\ storage_authenticity' = "VERIFIED"
     /\ rollback_status' = "VERIFIED_JOURNAL"
     /\ boot_integrity_status' = "NORMALIZED_TRANSIENT_TO_ISOLATED"
+    /\ active_event_id' = IF active_event_id \in ValidEvents THEN active_event_id ELSE "evt-1"
+    /\ active_challenge_id' = IF active_challenge_id \in ValidChallenges THEN active_challenge_id ELSE "chg-1"
     /\ reserved_tokens' = {}
     /\ dry_run_mode' = FALSE
     /\ last_action' = "REBOOT_TRANSIENT_NORMALIZE"
     /\ UNCHANGED <<
-        emergency_latch, emergency_epoch, active_event_id, active_challenge_id,
+        emergency_latch, emergency_epoch,
         policy_version, recovery_approval_status, consumed_tokens,
         kill_switch_status, network_block_confirmed, process_identity,
         domain_tag, quorum_distinct_signers, snap_recovery_epoch, snap_recovery_gen
@@ -494,7 +511,8 @@ FaultRebootIntegrityViolation(fault_status) ==
     /\ fault_status \in {
         "FAILED_HMAC", "FAILED_ROLLBACK", "FAILED_MISSING_STATE",
         "FAILED_MISSING_JOURNAL", "FAILED_STORAGE_WIPE", "FAILED_STATE_MISMATCH",
-        "FAILED_JOURNAL_DESYNC", "FAILED_PERSISTENCE"
+        "FAILED_JOURNAL_DESYNC", "FAILED_PERSISTENCE",
+        "FAILED_SEAL_MISSING", "FAILED_SEAL_TAMPER", "FAILED_ANCHOR_MISSING", "FAILED_ANCHOR_DESYNC"
        }
     /\ storage_authenticity = "VERIFIED"
     /\ prev_state' = state
@@ -533,7 +551,8 @@ Next ==
     \/ \E f \in {
         "FAILED_HMAC", "FAILED_ROLLBACK", "FAILED_MISSING_STATE",
         "FAILED_MISSING_JOURNAL", "FAILED_STORAGE_WIPE", "FAILED_STATE_MISMATCH",
-        "FAILED_JOURNAL_DESYNC", "FAILED_PERSISTENCE"
+        "FAILED_JOURNAL_DESYNC", "FAILED_PERSISTENCE",
+        "FAILED_SEAL_MISSING", "FAILED_SEAL_TAMPER", "FAILED_ANCHOR_MISSING", "FAILED_ANCHOR_DESYNC"
        } : FaultRebootIntegrityViolation(f)
 
 \* =========================================================================
@@ -582,7 +601,10 @@ I07_PersistenceConsistency ==
 
 \* I-08: Rollback Prevention
 I08_RollbackPrevention ==
-    (storage_authenticity \in {"FAILED_ROLLBACK", "FAILED_WAL_INCOMPLETE"}) =>
+    (storage_authenticity \in {
+        "FAILED_ROLLBACK", "FAILED_WAL_INCOMPLETE", "FAILED_SEAL_MISSING",
+        "FAILED_SEAL_TAMPER", "FAILED_ANCHOR_MISSING", "FAILED_ANCHOR_DESYNC"
+    }) =>
         (state = "ISOLATED")
 
 \* I-09: Event & Challenge Binding
@@ -610,7 +632,9 @@ I13_RebootSafety ==
 
 \* I-14: Kill Switch Consistency
 I14_KillSwitchConsistency ==
-    /\ (network_block_confirmed = TRUE => (state = "ISOLATED" /\ kill_switch_status = "OS_BLOCK_CONFIRMED"))
+    /\ (network_block_confirmed = TRUE =>
+        (state \in {"ISOLATED", "RECOVERY_PENDING", "RECOVERY_APPROVED", "ARMING"}
+         /\ kill_switch_status = "OS_BLOCK_CONFIRMED"))
     /\ (kill_switch_status = "OS_BLOCK_FAILED" => network_block_confirmed = FALSE)
 
 \* I-15: Fail-Closed Integrity
@@ -619,7 +643,8 @@ I15_FailClosedIntegrity ==
         "FAILED_HMAC", "FAILED_ROLLBACK", "FAILED_MISSING_STATE",
         "FAILED_MISSING_JOURNAL", "FAILED_STORAGE_WIPE", "FAILED_STATE_MISMATCH",
         "FAILED_JOURNAL_DESYNC", "FAILED_PERSISTENCE", "FAILED_WAL_INCOMPLETE",
-        "FAILED_LOAD", "FAILED_SCHEMA", "FAILED_KEY_SECURITY"
+        "FAILED_LOAD", "FAILED_SCHEMA", "FAILED_KEY_SECURITY",
+        "FAILED_SEAL_MISSING", "FAILED_SEAL_TAMPER", "FAILED_ANCHOR_MISSING", "FAILED_ANCHOR_DESYNC"
     }) => (state = "ISOLATED")
 
 \* I-16: Domain Separation (CORE vs Decoy)
@@ -642,7 +667,20 @@ I19_TransitionAuditability ==
 
 \* I-20: Safety Over Availability Priority
 I20_SafetyOverAvailabilityPriority ==
-    (emergency_latch = TRUE \/ wal_status = "PREPARED") => (state /= "ACTIVE" \/ last_action = "P0_LATCH_TRIGGER")
+    /\ (wal_status = "PREPARED" => state /= "ACTIVE")
+    /\ (emergency_latch = TRUE => last_action \notin {
+        "NORMAL_TRANSITION", "RECOVERY_PHASE_R1_PENDING",
+        "RECOVERY_STAGE1_APPROVED", "RECOVERY_STAGE2_ARMING", "RECOVERY_STAGE3_ACTIVE"
+       })
+
+\* I-21: IMSE Override (Layer B DANGER forces isolation regardless of Layer A)
+I21_IMSEOverride ==
+    (deterministic_danger = TRUE /\ state = "ACTIVE") => emergency_latch = TRUE
+
+\* I-22: Quorum Necessity (Isolation requires Layer A/B consensus or Quorum)
+I22_QuorumNecessity ==
+    (last_action = "P0_LATCH_TRIGGER") => 
+        (deterministic_danger = TRUE \/ ai_corrupted = TRUE)
 
 \* =========================================================================
 \* PART 2.4: Temporal Logic Properties (Separated Safety & Fair Liveness)
@@ -654,7 +692,11 @@ Fairness ==
     /\ WF_vars(ReArmRecoveryStage2)
     /\ WF_vars(CommitRecoveryStage3Active)
 
-Spec == Init /\ [][Next]_vars /\ Fairness
+SafetySpec == Init /\ [][Next]_vars
+
+FairSpec == SafetySpec /\ Fairness
+
+Spec == FairSpec
 
 \* Liveness L-01: Every triggered P0 latch leads to ISOLATED
 L01_P0LatchLeadsToIsolated ==

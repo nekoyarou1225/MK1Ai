@@ -1,5 +1,5 @@
 {
-  "summary": "MK1Ai FSM V3.2 Final Remediation & Complete Verification Report covering R-001 through R-005, P0-001 through P3-001, formal model checking logs, stress/fault-injection results, and full 491-test regression results.",
-  "updatedAt": "2026-11-06T23:52:35.616676035Z",
-  "userFacing": true
+  "summary":  "Final Verification & Critical Remediation Report for MK1Ai FSM V3.2 covering all P0/P1 remediations (Sections 1-10), 20 safety invariants (I-01..I-20), 14-scenario refinement mapping, 103 passing verification tests, and honest BLOCKED status for external tools/hardware.",
+  "updatedAt":  "2026-11-07T06:10:52.556480779Z",
+  "userFacing":  true
 }

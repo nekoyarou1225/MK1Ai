@@ -443,6 +443,7 @@ try:
     import fcntl as _fcntl_mod
 except ImportError:  # pragma: no cover
     _fcntl_mod = None  # type: ignore[assignment]
+fcntl = _fcntl_mod
 
 _FORBIDDEN_WEAK_HMAC_KEYS = {
     b"",
@@ -456,40 +457,516 @@ _FORBIDDEN_WEAK_HMAC_KEYS = {
 _MAX_CLOCK_FUTURE_SKEW_SEC = 300.0
 _MAX_VALID_UNIX_TIMESTAMP = 4_102_444_800.0  # 2100-01-01T00:00:00Z
 
+_GLOBAL_PROVISIONED_STORAGE_LEDGER: dict[str, tuple[int, str]] = {}
+_GLOBAL_PROVISIONED_STORAGE_LOCK = threading.Lock()
+_PRODUCTION_FSM_PATHS_REGISTRY: set[str] = set()
+_PRODUCTION_FSM_PATHS_LOCK = threading.Lock()
 
-class MonotonicCounterAnchor:
-    """Abstraction for hardware/software monotonic counter & boot provisioning seal (P0-004).
 
-    Probes for hardware TPM 2.0 (/dev/tpmrm0 or /dev/tpm0). In environments without
-    hardware TPM, enforces a separate signed software boot-anchor ledger and transparently
-    reports hardware anchor availability as 'SOFTWARE_ANCHOR_NO_TPM' (never falsely claiming TPM).
+class FSMLockError(TimeoutError, RuntimeError):
+    """Raised when OS-level inter-process lock (fcntl.flock) or lock file validation fails (Section 4 / I-08)."""
+
+
+class TPM2HardwareNVBackend:
+    """Strict TPM 2.0 NVRAM Hardware Monotonic Counter Backend (Section 1 / I-16).
+
+    Strictly separates:
+      1. Device node presence (/dev/tpmrm0, /dev/tpm0)
+      2. TPM2 tool / TSS driver availability
+      3. NV Index existence and attribute verification (TPMA_NV_COUNTER, TPMA_NV_ORDERLY, auth read/write, TPMA_NV_WRITTEN)
+      4. Actual NV counter read, hardware monotonic increment, and read-back verification.
+
+    Never treats regular files as TPM NVRAM, never reports TPM2_NVRAM_ACTIVE or
+    hardware_monotonic_protection=True unless real TPM NV operations succeed, and never
+    silently falls back to software files on TPM error.
     """
 
-    def __init__(self, anchor_path: str | None, hmac_key_getter):
-        self._anchor_path = anchor_path
+    TPM_NOT_CONFIGURED = "TPM_NOT_CONFIGURED"
+    TPM_UNAVAILABLE = "TPM_UNAVAILABLE"
+    TPM_DEVICE_PRESENT_UNVERIFIED = "TPM_DEVICE_PRESENT_UNVERIFIED"
+    TPM_DEVICE_PRESENT_TOOLS_MISSING = "TPM_DEVICE_PRESENT_UNVERIFIED"
+    TPM_NV_INDEX_MISSING = "TPM_NV_INDEX_MISSING"
+    TPM_NV_ATTR_INVALID = "TPM_NV_ATTR_INVALID"
+    TPM_NV_ATTRIBUTES_INVALID = "TPM_NV_ATTR_INVALID"
+    TPM_NV_UNINITIALIZED = "TPM_NV_UNINITIALIZED"
+    TPM_READ_FAILED = "TPM_READ_FAILED"
+    TPM_NV_READ_DENIED = "TPM_READ_FAILED"
+    TPM_NV_WRITE_DENIED = "TPM_INCREMENT_FAILED"
+    TPM_INCREMENT_FAILED = "TPM_INCREMENT_FAILED"
+    TPM_COUNTER_UPDATE_FAILED = "TPM_INCREMENT_FAILED"
+    TPM_COUNTER_MISMATCH = "TPM_COUNTER_MISMATCH"
+    TPM_NV_ERASED_OR_RESET = "TPM_NV_ERASED_OR_RESET"
+    TPM_COMMUNICATION_ERROR = "TPM_COMMUNICATION_ERROR"
+    TPM_VERIFIED_ACTIVE = "TPM_VERIFIED_ACTIVE"
+    TPM2_NVRAM_VERIFIED = "TPM_VERIFIED_ACTIVE"
+
+    def __init__(
+        self,
+        nv_index: str | int | None = None,
+        *,
+        enabled: bool = False,
+        device_paths: tuple[str, ...] = ("/dev/tpmrm0", "/dev/tpm0"),
+        driver: Any | None = None,
+        require_hardware_tpm: bool = False,
+    ):
+        if nv_index is None:
+            nv_index = os.environ.get("MK1_TPM_NV_INDEX")
+        self._nv_index = str(nv_index).strip() if nv_index is not None and str(nv_index).strip() else None
+        self._enabled = bool(enabled)
+        self._device_paths = tuple(device_paths)
+        self._driver = driver
+        env_req = str(os.environ.get("MK1_REQUIRE_HARDWARE_TPM", "")).lower() in {"1", "true", "yes", "on"}
+        self._require_hardware_tpm = bool(require_hardware_tpm or env_req or enabled)
+        self._status: str = self.TPM_NOT_CONFIGURED
+        self._hardware_verified: bool = False
+        self._last_verified_counter: int | None = None
+        self._ever_verified_active: bool = False
+        self._refresh_initial_status()
+
+    def _detect_char_device(self) -> str | None:
+        if self._driver is not None and hasattr(self._driver, "device_present"):
+            try:
+                return "/dev/tpmrm0" if bool(self._driver.device_present()) else None
+            except Exception:
+                return None
+        for dev in self._device_paths:
+            try:
+                if os.path.exists(dev):
+                    return dev
+            except OSError:
+                continue
+        return None
+
+    def _detect_tpm2_tools(self) -> tuple[bool, list[str]]:
+        if self._driver is not None:
+            return (True, [])
+        required = ("tpm2_nvreadpublic", "tpm2_nvread", "tpm2_nvinc")
+        missing = [cmd for cmd in required if shutil.which(cmd) is None]
+        return (len(missing) == 0, missing)
+
+    def _run_tpm_cmd(self, args: list[str], timeout_sec: float = 3.0) -> tuple[bool, int, bytes, str]:
+        try:
+            res = subprocess.run(
+                args,
+                capture_output=True,
+                timeout=timeout_sec,
+                check=False,
+            )
+            err_str = (res.stderr or b"").decode("utf-8", errors="replace")
+            return (res.returncode == 0, res.returncode, res.stdout or b"", err_str)
+        except subprocess.TimeoutExpired:
+            return (False, -1, b"", "TPM_COMMAND_TIMEOUT")
+        except OSError as exc:
+            return (False, -2, b"", str(exc))
+
+    def _refresh_initial_status(self) -> None:
+        dev = self._detect_char_device()
+        if not dev:
+            self._status = self.TPM_UNAVAILABLE
+            self._hardware_verified = False
+            return
+        if not self._nv_index:
+            self._status = self.TPM_NOT_CONFIGURED
+            self._hardware_verified = False
+            return
+        tools_ok, _ = self._detect_tpm2_tools()
+        if not tools_ok:
+            self._status = self.TPM_DEVICE_PRESENT_UNVERIFIED
+            self._hardware_verified = False
+            return
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @property
+    def hardware_monotonic_protection(self) -> bool:
+        return bool(self._hardware_verified and self._status == self.TPM_VERIFIED_ACTIVE)
+
+    @property
+    def is_required_or_configured(self) -> bool:
+        return bool(
+            self._enabled
+            or self._require_hardware_tpm
+            or self._nv_index is not None
+            or self._driver is not None
+            or self._ever_verified_active
+        )
+
+    def verify_and_read_counter(self) -> dict[str, Any]:
+        """Inspect NV index public attributes and read monotonic 64-bit counter value (Section 1)."""
+        dev = self._detect_char_device()
+        if not dev:
+            self._hardware_verified = False
+            self._status = (
+                self.TPM_COMMUNICATION_ERROR if self._ever_verified_active else self.TPM_UNAVAILABLE
+            )
+            return {
+                "status": self._status,
+                "hardware_verified": False,
+                "counter_value": None,
+                "device": None,
+            }
+
+        if not self._nv_index:
+            self._hardware_verified = False
+            self._status = self.TPM_NOT_CONFIGURED
+            return {
+                "status": self._status,
+                "hardware_verified": False,
+                "counter_value": None,
+                "device": dev,
+            }
+
+        tools_ok, missing_tools = self._detect_tpm2_tools()
+        if not tools_ok:
+            self._hardware_verified = False
+            self._status = self.TPM_DEVICE_PRESENT_UNVERIFIED
+            return {
+                "status": self._status,
+                "hardware_verified": False,
+                "counter_value": None,
+                "device": dev,
+                "missing_tools": missing_tools,
+            }
+
+        try:
+            if self._driver is not None:
+                pub = self._driver.nv_read_public(self._nv_index)
+                if not isinstance(pub, dict) or not pub.get("exists", False):
+                    self._hardware_verified = False
+                    self._status = self.TPM_NV_INDEX_MISSING
+                    return {"status": self._status, "hardware_verified": False, "counter_value": None}
+                if not pub.get("is_counter", False) or not pub.get("readable", True) or not pub.get("writable", True):
+                    self._hardware_verified = False
+                    self._status = self.TPM_NV_ATTR_INVALID
+                    return {"status": self._status, "hardware_verified": False, "counter_value": None}
+                if not pub.get("written", False):
+                    self._hardware_verified = False
+                    self._status = self.TPM_NV_UNINITIALIZED
+                    return {"status": self._status, "hardware_verified": False, "counter_value": None}
+                raw_val = self._driver.nv_read(self._nv_index)
+            else:
+                ok_pub, rc_pub, out_pub, err_pub = self._run_tpm_cmd(["tpm2_nvreadpublic", str(self._nv_index)])
+                if not ok_pub or rc_pub != 0:
+                    self._hardware_verified = False
+                    if rc_pub == -1 or "timeout" in err_pub.lower():
+                        self._status = self.TPM_COMMUNICATION_ERROR
+                    else:
+                        self._status = self.TPM_NV_INDEX_MISSING
+                    return {"status": self._status, "hardware_verified": False, "counter_value": None}
+
+                pub_txt = out_pub.decode("utf-8", errors="replace").lower()
+                is_counter = ("tpma_nv_counter" in pub_txt or "nt=counter" in pub_txt or "counter" in pub_txt)
+                has_read = ("authread" in pub_txt or "ownerread" in pub_txt or "ppread" in pub_txt)
+                has_write = ("authwrite" in pub_txt or "ownerwrite" in pub_txt or "ppwrite" in pub_txt)
+                is_written = ("tpma_nv_written" in pub_txt or "written" in pub_txt)
+
+                if not is_counter or not has_read or not has_write:
+                    self._hardware_verified = False
+                    self._status = self.TPM_NV_ATTR_INVALID
+                    return {"status": self._status, "hardware_verified": False, "counter_value": None}
+
+                if not is_written:
+                    self._hardware_verified = False
+                    self._status = self.TPM_NV_UNINITIALIZED
+                    return {"status": self._status, "hardware_verified": False, "counter_value": None}
+
+                ok_rd, rc_rd, out_rd, err_rd = self._run_tpm_cmd(["tpm2_nvread", str(self._nv_index)])
+                if not ok_rd or rc_rd != 0 or len(out_rd) < 8:
+                    self._hardware_verified = False
+                    self._status = self.TPM_COMMUNICATION_ERROR if rc_rd == -1 else self.TPM_READ_FAILED
+                    return {"status": self._status, "hardware_verified": False, "counter_value": None}
+                raw_val = int.from_bytes(out_rd[:8], byteorder="big", signed=False)
+
+            if not isinstance(raw_val, int) or isinstance(raw_val, bool) or raw_val < 0:
+                self._hardware_verified = False
+                self._status = self.TPM_READ_FAILED
+                return {"status": self._status, "hardware_verified": False, "counter_value": None}
+
+            if self._last_verified_counter is not None and raw_val < self._last_verified_counter:
+                self._hardware_verified = False
+                self._status = self.TPM_NV_ERASED_OR_RESET
+                return {"status": self._status, "hardware_verified": False, "counter_value": raw_val}
+
+            self._last_verified_counter = raw_val
+            self._ever_verified_active = True
+            self._hardware_verified = True
+            self._status = self.TPM_VERIFIED_ACTIVE
+            return {
+                "status": self._status,
+                "hardware_verified": True,
+                "counter_value": raw_val,
+                "device": dev,
+            }
+        except Exception as exc:
+            self._hardware_verified = False
+            self._status = self.TPM_COMMUNICATION_ERROR
+            return {
+                "status": self._status,
+                "hardware_verified": False,
+                "counter_value": None,
+                "error": str(exc),
+            }
+
+    def increment_and_verify(self, target_min_gen: int) -> dict[str, Any]:
+        """Increment TPM NV monotonic counter to target_min_gen and verify via read-back (Section 1)."""
+        pre = self.verify_and_read_counter()
+        if not pre["hardware_verified"] and pre["status"] != self.TPM_NV_UNINITIALIZED:
+            self._hardware_verified = False
+            if pre["status"] in (self.TPM_COMMUNICATION_ERROR, self.TPM_READ_FAILED):
+                self._status = self.TPM_INCREMENT_FAILED
+            else:
+                self._status = pre["status"]
+            return {"status": self._status, "hardware_verified": False, "counter_value": None}
+
+        current_val = 0 if pre["status"] == self.TPM_NV_UNINITIALIZED else int(pre["counter_value"] or 0)
+        if current_val > target_min_gen:
+            self._hardware_verified = False
+            self._status = self.TPM_COUNTER_MISMATCH
+            return {"status": self._status, "hardware_verified": False, "counter_value": current_val}
+
+        steps = max(1, target_min_gen - current_val) if pre["status"] == self.TPM_NV_UNINITIALIZED else (target_min_gen - current_val)
+        try:
+            for _ in range(steps):
+                if self._driver is not None:
+                    inc_ok = self._driver.nv_increment(self._nv_index)
+                    if inc_ok is False:
+                        self._hardware_verified = False
+                        self._status = self.TPM_INCREMENT_FAILED
+                        return {"status": self._status, "hardware_verified": False, "counter_value": None}
+                else:
+                    ok_inc, rc_inc, _, _ = self._run_tpm_cmd(["tpm2_nvinc", str(self._nv_index)])
+                    if not ok_inc or rc_inc != 0:
+                        self._hardware_verified = False
+                        self._status = self.TPM_INCREMENT_FAILED
+                        return {"status": self._status, "hardware_verified": False, "counter_value": None}
+
+            post = self.verify_and_read_counter()
+            if not post["hardware_verified"] or post["counter_value"] != target_min_gen:
+                self._hardware_verified = False
+                self._status = self.TPM_INCREMENT_FAILED
+                return {
+                    "status": self._status,
+                    "hardware_verified": False,
+                    "counter_value": post.get("counter_value"),
+                }
+
+            self._last_verified_counter = int(post["counter_value"])
+            self._ever_verified_active = True
+            self._hardware_verified = True
+            self._status = self.TPM_VERIFIED_ACTIVE
+            return {
+                "status": self._status,
+                "hardware_verified": True,
+                "counter_value": int(post["counter_value"]),
+            }
+        except Exception:
+            self._hardware_verified = False
+            self._status = self.TPM_INCREMENT_FAILED
+            return {"status": self._status, "hardware_verified": False, "counter_value": None}
+
+    def probe_and_read(self) -> tuple[bool, int, str]:
+        """Tuple wrapper around verify_and_read_counter() returning (ok, counter_value, status_code)."""
+        if not self.is_required_or_configured:
+            self._refresh_initial_status()
+            return (True, 0, self._status)
+        res = self.verify_and_read_counter()
+        if res["hardware_verified"]:
+            return (True, int(res["counter_value"] or 0), res["status"])
+        return (False, 2**62, res["status"])
+
+    def update_and_verify_counter(self, target_min_gen: int) -> tuple[bool, int, str]:
+        """Tuple wrapper around increment_and_verify() returning (ok, counter_value, status_code)."""
+        if not self.is_required_or_configured:
+            self._refresh_initial_status()
+            return (True, 0, self._status)
+        res = self.increment_and_verify(target_min_gen)
+        if res["hardware_verified"]:
+            return (True, int(res["counter_value"] or 0), res["status"])
+        return (False, 2**62, res["status"])
+
+
+class MonotonicCounterAnchor:
+    """Multi-Layer Monotonic Counter & Provisioning Seal with Honest TPM 2.0 Separation (Sections 1, 2, 3, 5).
+
+    Layers:
+      - Layer 1: Dedicated HMAC-signed Boot Anchor file (.boot_anchor in separate directory).
+      - Layer 2: Key-Embedded Cryptographic High-Water Seal (SEAL:v3.2:<prov>:<min_gen>:<state>:<mac>)
+                 mandatory on line 2 of the 0o600 HMAC key file (keys/fsm_hmac.key).
+      - Layer 3: Optional Software External Seal file (external_seal_path) — NEVER labeled as TPM.
+      - Layer 4: Real TPM 2.0 Hardware NV Counter Backend (TPM2HardwareNVBackend) — only reports
+                 TPM2_NVRAM_VERIFIED / hardware_monotonic_protection=True when actual TPM NV operations succeed.
+      - Layer 5: Runtime Monotonic Provisioning Ledger (_GLOBAL_PROVISIONED_STORAGE_LEDGER).
+    """
+
+    def __init__(
+        self,
+        anchor_path: str | None,
+        hmac_key_getter,
+        *,
+        state_path: str | None = None,
+        key_path: str | None = None,
+        external_seal_path: str | None = None,
+        tpm_nv_path: str | None = None,
+        tpm_backend: TPM2HardwareNVBackend | None = None,
+        require_hardware_tpm: bool = False,
+    ):
+        self._anchor_path = os.path.abspath(anchor_path) if anchor_path else None
+        self._state_path = os.path.abspath(state_path) if state_path else None
+        self._key_path = os.path.abspath(key_path) if key_path else None
+        eff_ext = external_seal_path or tpm_nv_path or os.environ.get("MK1_EXTERNAL_SEAL_PATH") or os.environ.get("MK1_TPM_NV_STATE_PATH")
+        self._external_seal_path = os.path.abspath(eff_ext) if eff_ext else None
         self._get_hmac_key = hmac_key_getter
-        self._tpm_available = any(
-            os.path.exists(dev) for dev in ("/dev/tpmrm0", "/dev/tpm0")
+        self._tpm_backend = (
+            tpm_backend
+            if tpm_backend is not None
+            else TPM2HardwareNVBackend(require_hardware_tpm=require_hardware_tpm)
         )
 
     @property
+    def tpm_backend(self) -> TPM2HardwareNVBackend:
+        return self._tpm_backend
+
+    @property
+    def hardware_monotonic_protection(self) -> bool:
+        return self._tpm_backend.hardware_monotonic_protection
+
+    @property
+    def tpm_status(self) -> str:
+        return self._tpm_backend.status
+
+    @property
     def hardware_status(self) -> str:
-        return "TPM2_DETECTED" if self._tpm_available else "SOFTWARE_ANCHOR_NO_TPM"
+        if self._tpm_backend.hardware_monotonic_protection:
+            return "TPM2_NVRAM_VERIFIED"
+        if self._tpm_backend.is_required_or_configured:
+            return self._tpm_backend.status
+        if self._external_seal_path:
+            return "SOFTWARE_EXTERNAL_SEAL_NO_TPM"
+        if self._key_path:
+            return "SOFTWARE_KEY_SEAL_NO_TPM"
+        return "SOFTWARE_ANCHOR_NO_TPM"
 
     def _compute_anchor_mac(self, provisioned: bool, min_gen: int, last_state: str) -> str:
         key = self._get_hmac_key()
         payload = f"ANCHOR:v3.2:{int(provisioned)}:{min_gen}:{last_state}".encode("utf-8")
         return hmac.new(key, payload, hashlib.sha256).hexdigest()
 
-    def exists(self) -> bool:
-        return bool(self._anchor_path and os.path.isfile(self._anchor_path))
+    @staticmethod
+    def compute_key_seal_mac(derived_key: bytes, provisioned: bool, min_gen: int, last_state: str) -> str:
+        payload = f"KEY_SEAL:v3.2:{int(provisioned)}:{min_gen}:{last_state}".encode("utf-8")
+        return hmac.new(derived_key, payload, hashlib.sha256).hexdigest()
 
-    def read_anchor(self) -> tuple[bool, int, str, bool]:
-        """Return (provisioned, min_generation, last_state, integrity_ok)."""
-        if not self._anchor_path or not os.path.isfile(self._anchor_path):
+    @classmethod
+    def format_key_seal_line(cls, derived_key: bytes, provisioned: bool, min_gen: int, last_state: str) -> bytes:
+        mac = cls.compute_key_seal_mac(derived_key, provisioned, min_gen, last_state)
+        return f"SEAL:v3.2:{int(provisioned)}:{int(min_gen)}:{last_state}:{mac}".encode("ascii")
+
+    @classmethod
+    def classify_and_verify_key_seal(cls, derived_key: bytes, seal_line: bytes) -> tuple[bool, int, str, bool, str]:
+        """Classify and verify SEAL line (Section 2).
+
+        Returns (provisioned, min_gen, last_state, seal_ok, status_reason).
+        """
+        try:
+            text = seal_line.decode("ascii").strip()
+            if not text:
+                return (True, 2**62, "ISOLATED", False, "FAILED_SEAL_MISSING")
+            parts = text.split(":")
+            if len(parts) != 6 or parts[0] != "SEAL" or parts[1] != "v3.2":
+                return (True, 2**62, "ISOLATED", False, "FAILED_SEAL_CORRUPTED")
+            prov_int = int(parts[2])
+            if prov_int not in (0, 1):
+                return (True, 2**62, "ISOLATED", False, "FAILED_SEAL_CORRUPTED")
+            provisioned = bool(prov_int)
+            min_gen = int(parts[3])
+            if min_gen < 0:
+                return (True, 2**62, "ISOLATED", False, "FAILED_SEAL_CORRUPTED")
+            last_state = parts[4]
+            if not last_state or last_state not in {"OFF", "ARMING", "ACTIVE", "EMERGENCY", "ISOLATED", "RECOVERY_PENDING", "RECOVERY_APPROVED"}:
+                return (True, 2**62, "ISOLATED", False, "FAILED_SEAL_CORRUPTED")
+            mac = parts[5]
+            if len(mac) != 64:
+                return (True, 2**62, "ISOLATED", False, "FAILED_SEAL_CORRUPTED")
+            expected = cls.compute_key_seal_mac(derived_key, provisioned, min_gen, last_state)
+            if not hmac.compare_digest(expected, mac):
+                return (True, 2**62, "ISOLATED", False, "FAILED_SEAL_MAC")
+            return (provisioned, min_gen, last_state, True, "VERIFIED_SEAL")
+        except Exception:
+            return (True, 2**62, "ISOLATED", False, "FAILED_SEAL_CORRUPTED")
+
+    @classmethod
+    def parse_and_verify_key_seal(cls, derived_key: bytes, seal_line: bytes) -> tuple[bool, int, str, bool]:
+        prov, min_gen, last_state, ok, _ = cls.classify_and_verify_key_seal(derived_key, seal_line)
+        return (prov, min_gen, last_state, ok)
+
+    def _read_key_embedded_seal(self) -> tuple[bool, int, str, bool]:
+        """Read and verify mandatory line-2 SEAL from key_path (Section 2 / I-17).
+
+        If key_path exists on disk and has < 2 lines (SEAL line deleted), returns integrity_ok=False!
+        """
+        if not self._key_path or not os.path.lexists(self._key_path):
             return (False, 0, "OFF", True)
         try:
-            with open(self._anchor_path, "r", encoding="utf-8") as af:
+            st = os.lstat(self._key_path)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                return (True, 2**62, "ISOLATED", False)
+            with open(self._key_path, "rb") as kf:
+                lines = [ln.strip() for ln in kf.read().splitlines() if ln.strip()]
+            # Section 2 Mandatory Rule: A key file with < 2 lines is NEVER unprovisioned; it is SEAL deletion!
+            if len(lines) != 2:
+                return (True, 2**62, "ISOLATED", False)
+            return self.parse_and_verify_key_seal(self._get_hmac_key(), lines[1])
+        except Exception:
+            return (True, 2**62, "ISOLATED", False)
+
+    def _write_key_embedded_seal(self, min_gen: int, last_state: str) -> bool:
+        if not self._key_path or not os.path.lexists(self._key_path):
+            return True
+        try:
+            st = os.lstat(self._key_path)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                raise PermissionError("Invalid or linked key file path")
+            with open(self._key_path, "rb") as kf:
+                lines = [ln.strip() for ln in kf.read().splitlines() if ln.strip()]
+            if not lines:
+                return False
+            raw_key_line = lines[0]
+            seal_line = self.format_key_seal_line(self._get_hmac_key(), True, int(min_gen), str(last_state))
+            parent_dir = os.path.dirname(self._key_path)
+            fd, tmp_k = tempfile.mkstemp(
+                prefix=f".kseal.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.",
+                suffix=".tmp",
+                dir=parent_dir or None,
+            )
+            try:
+                with os.fdopen(fd, "wb") as kf:
+                    kf.write(raw_key_line + b"\n" + seal_line + b"\n")
+                    kf.flush()
+                    os.fsync(kf.fileno())
+                os.chmod(tmp_k, 0o600)
+                os.replace(tmp_k, self._key_path)
+                MK1SafetyStateMachine._fsync_parent_dir(self._key_path)
+            finally:
+                if os.path.exists(tmp_k):
+                    try:
+                        os.unlink(tmp_k)
+                    except OSError:
+                        pass
+            return True
+        except Exception as exc:
+            log.error(f"[FSM] 鍵埋め込みシール更新失敗: {exc}")
+            return False
+
+    def _read_single_anchor_file(self, path: str | None) -> tuple[bool, int, str, bool]:
+        if not path or not os.path.lexists(path):
+            return (False, 0, "OFF", True)
+        try:
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                return (True, 2**62, "ISOLATED", False)
+            with open(path, "r", encoding="utf-8") as af:
                 adata = json.load(af)
             if not isinstance(adata, dict):
                 return (True, 2**62, "ISOLATED", False)
@@ -513,23 +990,30 @@ class MonotonicCounterAnchor:
         except Exception:
             return (True, 2**62, "ISOLATED", False)
 
-    def write_anchor(self, min_gen: int, last_state: str) -> bool:
-        if not self._anchor_path:
+    def _write_single_anchor_file(self, path: str | None, min_gen: int, last_state: str) -> bool:
+        if not path:
             return True
         try:
-            parent_dir = os.path.dirname(self._anchor_path)
+            parent_dir = os.path.dirname(path)
             if parent_dir:
+                if os.path.islink(parent_dir):
+                    raise PermissionError(f"Anchor parent directory is a symlink: {parent_dir}")
                 os.makedirs(parent_dir, exist_ok=True)
+            if os.path.lexists(path):
+                st = os.lstat(path)
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                    raise PermissionError(f"Anchor target is symlink or hardlink: {path}")
             adata = {
                 "version": "3.2",
                 "provisioned": True,
                 "min_generation": int(min_gen),
                 "last_state": str(last_state),
                 "hardware_anchor": self.hardware_status,
+                "hardware_monotonic_protection": self.hardware_monotonic_protection,
                 "anchor_mac": self._compute_anchor_mac(True, int(min_gen), str(last_state)),
             }
             fd, tmp_path = tempfile.mkstemp(
-                prefix=f".anchor.{os.getpid()}.{threading.get_ident()}.",
+                prefix=f".anchor.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.",
                 suffix=".tmp",
                 dir=parent_dir or None,
             )
@@ -539,7 +1023,8 @@ class MonotonicCounterAnchor:
                     af.flush()
                     os.fsync(af.fileno())
                 os.chmod(tmp_path, 0o600)
-                os.replace(tmp_path, self._anchor_path)
+                os.replace(tmp_path, path)
+                MK1SafetyStateMachine._fsync_parent_dir(path)
             finally:
                 if os.path.exists(tmp_path):
                     try:
@@ -551,12 +1036,273 @@ class MonotonicCounterAnchor:
             log.error(f"[FSM] ブートアンカー書き込み失敗: {exc}")
             return False
 
+    def exists(self) -> bool:
+        if self._anchor_path and os.path.lexists(self._anchor_path):
+            return True
+        if self._external_seal_path and os.path.lexists(self._external_seal_path):
+            return True
+        k_prov, k_gen, _, k_ok = self._read_key_embedded_seal()
+        if not k_ok or (k_prov and k_gen >= 1):
+            return True
+        if self._tpm_backend.is_required_or_configured:
+            tpm_ok, tpm_gen, _ = self._tpm_backend.probe_and_read()
+            if not tpm_ok or tpm_gen >= 1:
+                return True
+        if self._state_path:
+            with _GLOBAL_PROVISIONED_STORAGE_LOCK:
+                if self._state_path in _GLOBAL_PROVISIONED_STORAGE_LEDGER:
+                    return True
+        return False
+
+    def read_anchor(self) -> tuple[bool, int, str, bool]:
+        """Return aggregated (provisioned, max_min_generation, last_state, integrity_ok) across all layers."""
+        a_prov, a_gen, a_state, a_ok = self._read_single_anchor_file(self._anchor_path)
+        if not a_ok:
+            return (True, 2**62, "ISOLATED", False)
+
+        ext_prov, ext_gen, ext_state, ext_ok = self._read_single_anchor_file(self._external_seal_path)
+        if not ext_ok:
+            return (True, 2**62, "ISOLATED", False)
+
+        k_prov, k_gen, k_state, k_ok = self._read_key_embedded_seal()
+        if not k_ok:
+            return (True, 2**62, "ISOLATED", False)
+
+        tpm_prov = False
+        tpm_gen = 0
+        if self._tpm_backend.is_required_or_configured:
+            tpm_ok, tpm_val, _ = self._tpm_backend.probe_and_read()
+            if not tpm_ok:
+                return (True, 2**62, "ISOLATED", False)
+            if tpm_val > 0:
+                tpm_prov = True
+                tpm_gen = tpm_val
+
+        mem_prov = False
+        mem_gen = 0
+        mem_state = "OFF"
+        if self._state_path:
+            with _GLOBAL_PROVISIONED_STORAGE_LOCK:
+                if self._state_path in _GLOBAL_PROVISIONED_STORAGE_LEDGER:
+                    mem_prov = True
+                    mem_gen, mem_state = _GLOBAL_PROVISIONED_STORAGE_LEDGER[self._state_path]
+
+        provisioned = bool(a_prov or ext_prov or (k_prov and k_gen >= 1) or tpm_prov or mem_prov)
+        best_gen = 0
+        best_state = "OFF"
+        for prov, gen, st in (
+            (a_prov, a_gen, a_state),
+            (ext_prov, ext_gen, ext_state),
+            (k_prov, k_gen, k_state),
+            (tpm_prov, tpm_gen, a_state if a_prov else "ISOLATED"),
+            (mem_prov, mem_gen, mem_state),
+        ):
+            if prov and gen >= best_gen:
+                best_gen = gen
+                best_state = st
+        return (provisioned, best_gen, best_state, True)
+
+    def verify_layer_consistency(self, expected_gen: int, expected_state: str) -> tuple[bool, str]:
+        """Verify that Anchor, Key SEAL, External Seal, and TPM NVRAM all agree with (expected_gen, expected_state)."""
+        if self._anchor_path and os.path.lexists(self._anchor_path):
+            a_prov, a_gen, a_state, a_ok = self._read_single_anchor_file(self._anchor_path)
+            if not a_ok:
+                return (False, "CORRUPTED_ANCHOR")
+            if not a_prov or a_gen != expected_gen or a_state != expected_state:
+                return (False, "ANCHOR_ROLLBACK_DETECTED" if a_gen > expected_gen else "ANCHOR_DESYNC_DETECTED")
+
+        if self._key_path and os.path.lexists(self._key_path):
+            k_prov, k_gen, k_state, k_ok = self._read_key_embedded_seal()
+            if not k_ok:
+                return (False, "CORRUPTED_KEY_SEAL")
+            if not k_prov or k_gen != expected_gen or k_state != expected_state:
+                return (False, "ANCHOR_ROLLBACK_DETECTED" if k_gen > expected_gen else "KEY_SEAL_DESYNC_DETECTED")
+
+        if self._external_seal_path and os.path.lexists(self._external_seal_path):
+            e_prov, e_gen, e_state, e_ok = self._read_single_anchor_file(self._external_seal_path)
+            if not e_ok:
+                return (False, "CORRUPTED_EXTERNAL_SEAL")
+            if not e_prov or e_gen != expected_gen or e_state != expected_state:
+                return (False, "ANCHOR_ROLLBACK_DETECTED" if e_gen > expected_gen else "EXTERNAL_SEAL_DESYNC_DETECTED")
+
+        if self._tpm_backend.is_required_or_configured:
+            tpm_ok, tpm_val, tpm_st = self._tpm_backend.probe_and_read()
+            if not tpm_ok:
+                return (False, tpm_st)
+            if tpm_val != expected_gen:
+                return (
+                    False,
+                    "TPM_ROLLBACK_DETECTED" if tpm_val > expected_gen else "TPM_COUNTER_MISMATCH",
+                )
+
+        return (True, "VERIFIED_ALL_LAYERS")
+
+    def write_anchor(self, min_gen: int, last_state: str) -> bool:
+        high_gen = int(min_gen)
+        if self._state_path:
+            with _GLOBAL_PROVISIONED_STORAGE_LOCK:
+                prev_entry = _GLOBAL_PROVISIONED_STORAGE_LEDGER.get(self._state_path)
+                if prev_entry and prev_entry[0] > high_gen:
+                    high_gen = prev_entry[0]
+                _GLOBAL_PROVISIONED_STORAGE_LEDGER[self._state_path] = (high_gen, str(last_state))
+
+        if not self._write_single_anchor_file(self._anchor_path, high_gen, last_state):
+            return False
+        if not self._write_single_anchor_file(self._external_seal_path, high_gen, last_state):
+            return False
+        if not self._write_key_embedded_seal(high_gen, last_state):
+            return False
+        if self._tpm_backend.is_required_or_configured:
+            tpm_ok, _, _ = self._tpm_backend.update_and_verify_counter(high_gen)
+            if not tpm_ok:
+                log.critical(f"[FSM] TPM 2.0 NVRAM カウンター更新失敗 ({self._tpm_backend.status})。ソフトウェアフォールバックを禁止します。")
+                return False
+        return True
+
+
+class DeterministicVerdict:
+    SAFE = "SAFE"
+    SUSPICIOUS = "SUSPICIOUS"
+    DANGER = "DANGER"
+    CORRUPTED = "CORRUPTED"
+
+
+class MK1MathematicalSecurityEngine:
+    """Independent Mathematical Security Engine (IMSE) - Layer B.
+    
+    Determines safety based on deterministic rules, bounded arithmetic, and 
+    protocol invariants, completely independent of AI model weights.
+    """
+    def __init__(self, policy_version: int = 1):
+        self.policy_version = policy_version
+        self._anomaly_history = deque(maxlen=100)
+        self._lock = threading.Lock()
+
+    def evaluate_packet(self, packet_bytes: bytes, features: list[float] | tuple[float, ...]) -> str:
+        """Apply deterministic rules to input data."""
+        # 1. Bounded Arithmetic & Data Integrity Check
+        if any(not math.isfinite(f) or f < 0.0 or f > 1.0 for f in features):
+            return DeterministicVerdict.CORRUPTED
+
+        # 2. Protocol Invariant: No fragments allowed in CORE unless specifically policy-exempt
+        # (Simplified check: check if it's a non-first fragment)
+        if len(features) >= 10 and features[9] >= 0.9: # feature[9] represents fragmentation indicator in V3
+            return DeterministicVerdict.DANGER
+
+        # 3. High Entropy + Known Attack Signature (DPI result integrated deterministically)
+        # feature[1] is entropy, feature[2] is DPI score
+        if features[1] > 0.95 and features[2] > 0.9:
+            return DeterministicVerdict.DANGER
+
+        # 4. Sequential Consistency: Rapid burst of anomalous features
+        with self._lock:
+            if features[2] > 0.8:
+                self._anomaly_history.append(1.0)
+            else:
+                self._anomaly_history.append(0.0)
+
+            avg_recent = sum(self._anomaly_history) / max(1, len(self._anomaly_history))
+
+            
+            if len(self._anomaly_history) >= 10 and avg_recent > 0.7:
+                return DeterministicVerdict.DANGER
+
+        if max(features) > 0.85:
+            return DeterministicVerdict.SUSPICIOUS
+
+        return DeterministicVerdict.SAFE
+
+
+class MK1SafetySupervisor:
+    """Independent Safety Supervisor (ISS) - Layer C.
+    
+    The final arbiter of security actions. Integrates AI-TIE and IMSE results
+    based on the Hybrid Decision Matrix and enforces mathematical overrides.
+    """
+    def __init__(self, fsm: "MK1SafetyStateMachine", math_engine: MK1MathematicalSecurityEngine):
+        self.fsm = fsm
+        self.math_engine = math_engine
+        self._last_ai_report: dict[str, Any] = {}
+        self._last_math_verdict: str = DeterministicVerdict.SAFE
+        self._override_latch: bool = False
+
+    def evaluate_hybrid_threat(self, ai_report: dict[str, Any], packet_bytes: bytes, 
+                               features: list[float] | tuple[float, ...], autonomous: bool = False) -> bool:
+        """Enforce the Hybrid Decision Matrix: IMSE > AI-TIE."""
+        math_verdict = self.math_engine.evaluate_packet(packet_bytes, features)
+        self._last_ai_report = ai_report
+        self._last_math_verdict = math_verdict
+
+        ai_score = float(ai_report.get("threat_score", 0.0))
+        ai_corrupted = not math.isfinite(ai_score) or ai_report.get("inference_status") == "corrupted"
+
+        trigger_isolation = False
+        reason = "Unknown"
+
+        # 1. Mathematical Engine Override (DANGER is unconditional)
+        if math_verdict == DeterministicVerdict.DANGER:
+            trigger_isolation = True
+            reason = "IMSE Deterministic Danger Detection (AI overridden)"
+            self._override_latch = True
+        
+        # 2. Data Corruption / AI Takeover Detection
+        elif math_verdict == DeterministicVerdict.CORRUPTED or ai_corrupted:
+            trigger_isolation = True
+            reason = "Data Integrity / AI Model Corruption Detected (Fail-Closed)"
+        
+        # 3. AI High-Confidence Threat (Validated by IMSE not being SAFE)
+        elif ai_score >= 0.99:
+            if math_verdict != DeterministicVerdict.SAFE:
+                trigger_isolation = True
+                reason = f"AI-TIE P0 Detection (Validated by IMSE: {math_verdict})"
+            else:
+                log.warning(f"[ISS] AI P0 detected but IMSE is SAFE. Restricting AI instead of isolating CORE.")
+                # We don't trigger isolation, but we might record this as a suspicious event
+                self.fsm._record_audit("AI_IMSE_MISMATCH", self.fsm._state, self.fsm._state, 
+                                      f"AI high score ({ai_score:.3f}) rejected by IMSE SAFE status")
+        
+        # 4. IMSE Suspicious + AI Suspicious
+        elif math_verdict == DeterministicVerdict.SUSPICIOUS and ai_score > 0.8:
+            log.info(f"[ISS] Hybrid Suspicious state detected. Monitoring closely.")
+            # No isolation yet, but we could trigger ONI_MODE or something similar
+
+        if trigger_isolation and autonomous:
+            self.perform_autonomous_isolation(reason)
+        
+        return trigger_isolation
+
+
+    def perform_autonomous_isolation(self, reason: str) -> bool:
+        """The ONLY path to trigger autonomous isolation."""
+        log.critical(f"[ISS] !!! MATHEMATICAL SAFETY POLICY TRIGGERED: {reason} !!!")
+        
+        # Priority: CORE Isolation > Everything Else
+        self.fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_REQUESTED, confirmed=False)
+        self.fsm.isolate_immediately(reason=reason)
+        
+        # Dispatch Kill Switch via privileged agent
+        management_route = _configured_management_route()
+        success = _dispatch_privileged_command(
+            "kill_switch", 
+            interface=None, # Global
+            dry_run=False, 
+            autonomous_bypass=True, 
+            **management_route
+        )
+        
+        if not success:
+             # Fallback to local execution if dispatch fails
+             execute_kill_switch(None, False, autonomous_bypass=True, **management_route)
+        
+        return True
+
 
 class MK1SafetyStateMachine:
     """MK1Ai Security State Machine (FSM) V3.2
     Manages transitions between 7 defense states with formal Fail-Closed guarantees,
-    atomic emergency preemption, WAL journal/state consistency, cross-process locking,
-    strict Dry-Run non-interference, and 8-state Kill Switch tracking.
+    atomic emergency preemption, 10-step WAL journal/state/anchor/seal consistency,
+    strict cross-process locking, Dry-Run non-interference, honest TPM 2.0 verification,
+    and 8-state Kill Switch tracking.
 
     Control States (S):
     1. OFF: Protection service inactive.
@@ -592,6 +1338,9 @@ class MK1SafetyStateMachine:
     KS_PARTIALLY_ISOLATED = "PARTIALLY_ISOLATED"
     KS_VERIFICATION_FAILED = "VERIFICATION_FAILED"
 
+    WAL_PREPARED = "PREPARED"
+    WAL_COMMITTED = "COMMITTED"
+
     VALID_KILL_SWITCH_STATES = frozenset({
         KS_NOT_REQUESTED,
         KS_REQUESTED,
@@ -603,6 +1352,22 @@ class MK1SafetyStateMachine:
         KS_VERIFICATION_FAILED,
     })
 
+    @property
+    def _lock_file_path(self) -> str | None:
+        return self._lock_path
+
+    @_lock_file_path.setter
+    def _lock_file_path(self, val: str | None) -> None:
+        self._lock_path = val
+
+    @property
+    def _key_file_path(self) -> str | None:
+        return self._key_path
+
+    @_key_file_path.setter
+    def _key_file_path(self, val: str | None) -> None:
+        self._key_path = val
+
     def __init__(
         self,
         state_path: str | None = None,
@@ -610,16 +1375,44 @@ class MK1SafetyStateMachine:
         journal_path: str | None = None,
         anchor_path: str | None = None,
         key_path: str | None = None,
+        key_file_path: str | None = None,
+        external_seal_path: str | None = None,
+        tpm_nv_path: str | None = None,
+        tpm_backend: TPM2HardwareNVBackend | None = None,
+        require_hardware_tpm: bool = False,
         hmac_key: bytes | str | None = None,
         lock_timeout_sec: float = 2.0,
         strict_dry_run_isolation: bool | None = None,
         require_existing_state: bool = False,
+        allow_initial_provisioning: bool | None = None,
+        production_mode: bool = False,
+        reject_temp_storage: bool = False,
+        dry_run_only: bool = False,
         normalize_transient_on_boot: bool = True,
     ):
+        if key_path is None and key_file_path is not None:
+            key_path = key_file_path
         if strict_dry_run_isolation is False:
             raise ValueError("Disabling strict_dry_run_isolation is prohibited in FSM V3.2 (P0-002)")
         self._strict_dry_run_isolation: bool = True
+        self._production_mode = bool(production_mode)
+        self._dry_run_only = bool(dry_run_only)
+        if self._production_mode and self._dry_run_only:
+            raise ValueError("FSM instance cannot be both production_mode=True and dry_run_only=True")
+
+        self._missing_production_path: bool = bool(self._production_mode and not state_path)
+
         self._state_path = os.path.abspath(state_path) if state_path else None
+        if self._state_path and (reject_temp_storage or os.environ.get("MK1_REJECT_TEMP_STORAGE") == "1"):
+            tmp_root = os.path.abspath(tempfile.gettempdir())
+            if (
+                self._state_path.startswith(tmp_root + os.sep)
+                or self._state_path.startswith("/tmp/")
+                or self._state_path.startswith("/var/tmp/")
+                or self._state_path.startswith("/dev/shm/")
+            ):
+                raise RuntimeError(f"Temporary directory storage is prohibited for production FSM: {self._state_path}")
+
         self._journal_path = (
             os.path.abspath(journal_path)
             if journal_path
@@ -640,9 +1433,62 @@ class MK1SafetyStateMachine:
                 else None
             )
         )
-        self._require_existing_state = bool(require_existing_state)
+        eff_ext_seal = external_seal_path or tpm_nv_path
+        self._external_seal_path = os.path.abspath(eff_ext_seal) if eff_ext_seal else None
+        self._tpm_nv_path = self._external_seal_path
+
+        # Enforce strict storage/key separation between Production and Dry-Run instances (Section 3 Req 10 / I-14)
+        my_paths = {
+            p for p in (self._state_path, self._journal_path, self._anchor_path, self._key_path) if p is not None
+        }
+        if self._dry_run_only and my_paths:
+            with _PRODUCTION_FSM_PATHS_LOCK:
+                overlap = my_paths & _PRODUCTION_FSM_PATHS_REGISTRY
+            if overlap:
+                raise ValueError(f"Dry-Run FSM cannot share storage or key paths with Production FSM: {sorted(overlap)}")
+        elif self._production_mode and my_paths:
+            with _PRODUCTION_FSM_PATHS_LOCK:
+                _PRODUCTION_FSM_PATHS_REGISTRY.update(my_paths)
+
+        # Record whether key file or multi-directory layout already existed on disk prior to __init__
+        self._key_existed_at_boot: bool = bool(self._key_path and os.path.lexists(self._key_path))
+        self._storage_dirs_existed_at_boot: bool = bool(
+            self._state_path
+            and self._journal_path
+            and self._anchor_path
+            and self._key_path
+            and len({
+                os.path.dirname(self._state_path),
+                os.path.dirname(self._journal_path),
+                os.path.dirname(self._anchor_path),
+                os.path.dirname(self._key_path),
+            }) >= 3
+            and all(
+                os.path.isdir(os.path.dirname(p))
+                for p in (self._state_path, self._journal_path, self._anchor_path, self._key_path)
+            )
+        )
+
+        if allow_initial_provisioning is None:
+            if self._production_mode or require_existing_state:
+                self._allow_initial_provisioning = False
+            else:
+                self._allow_initial_provisioning = True
+        else:
+            self._allow_initial_provisioning = bool(allow_initial_provisioning)
+
+        self._require_existing_state = bool(require_existing_state or not self._allow_initial_provisioning)
         self._normalize_transient_on_boot = bool(normalize_transient_on_boot)
         self._lock_timeout_sec = max(0.05, float(lock_timeout_sec))
+
+        # Ensure initial lock parent directory exists when state_path is configured and not a symlink
+        if self._lock_path:
+            lock_parent = os.path.dirname(self._lock_path)
+            if lock_parent and not os.path.lexists(lock_parent):
+                try:
+                    os.makedirs(lock_parent, exist_ok=True)
+                except OSError:
+                    pass
 
         # Core state variables (Formal Model Tuple Sigma)
         self._state = self.OFF
@@ -701,19 +1547,111 @@ class MK1SafetyStateMachine:
 
         self._hmac_key: bytes = b""
         self._key_security_failed: bool = False
+        self._key_failure_reason: str = "FAILED_KEY_SECURITY"
+        if self._missing_production_path:
+            self._hmac_key = secrets.token_bytes(32)
+            self._anchor = MonotonicCounterAnchor(
+                None,
+                lambda: self._hmac_key,
+                tpm_backend=tpm_backend,
+                require_hardware_tpm=require_hardware_tpm,
+            )
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
+            self._authenticity_status = "FAILED_MISSING_PRODUCTION_PATH"
+            self._rollback_protection_status = "MISSING_PRODUCTION_PATH"
+            self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+            return
+
         self._init_hmac_key(hmac_key)
-        self._anchor = MonotonicCounterAnchor(self._anchor_path, lambda: self._hmac_key)
+        self._anchor = MonotonicCounterAnchor(
+            self._anchor_path,
+            lambda: self._hmac_key,
+            state_path=self._state_path,
+            key_path=self._key_path,
+            external_seal_path=self._external_seal_path,
+            tpm_backend=tpm_backend,
+            require_hardware_tpm=require_hardware_tpm,
+        )
 
         if self._key_security_failed:
             self._state = self.ISOLATED
             self._simulated_state = self.ISOLATED
-            self._authenticity_status = "FAILED_KEY_SECURITY"
+            self._authenticity_status = self._key_failure_reason
+            self._rollback_protection_status = "KEY_OR_SEAL_VIOLATION"
+            self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+        elif self._anchor.tpm_backend.is_required_or_configured and not self._anchor.tpm_backend.probe_and_read()[0]:
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
+            self._authenticity_status = "FAILED_TPM_SECURITY"
+            self._rollback_protection_status = self._anchor.tpm_backend.status
             self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
         elif self._state_path is not None:
             self._load_persistent_state()
 
+    @classmethod
+    def provision_initial_storage(
+        cls,
+        state_path: str,
+        *,
+        journal_path: str | None = None,
+        anchor_path: str | None = None,
+        key_path: str | None = None,
+        external_seal_path: str | None = None,
+        tpm_backend: TPM2HardwareNVBackend | None = None,
+        hmac_key: bytes | str | None = None,
+    ) -> "MK1SafetyStateMachine":
+        """Explicitly provision a brand-new FSM storage directory (Section 2 & Section 3).
+
+        Rejects provisioning if any state, journal, anchor, or key file already exists.
+        Writes initial verified state (OFF -> ARMING -> ACTIVE or OFF at gen=1) atomically.
+        """
+        s_abs = os.path.abspath(state_path)
+        j_abs = os.path.abspath(journal_path) if journal_path else f"{s_abs}.gen_journal"
+        a_abs = os.path.abspath(anchor_path) if anchor_path else f"{j_abs}.boot_anchor"
+        k_abs = os.path.abspath(key_path) if key_path else (
+            os.path.join(os.path.dirname(s_abs), ".mk1_fsm_hmac.key") if hmac_key is None else None
+        )
+        for existing in (s_abs, j_abs, a_abs, k_abs):
+            if existing and os.path.lexists(existing):
+                raise FileExistsError(f"Cannot initial-provision over existing file: {existing}")
+
+        fsm = cls(
+            state_path=s_abs,
+            journal_path=j_abs,
+            anchor_path=a_abs,
+            key_path=k_abs,
+            external_seal_path=external_seal_path,
+            tpm_backend=tpm_backend,
+            hmac_key=hmac_key,
+            allow_initial_provisioning=True,
+            require_existing_state=False,
+        )
+        fsm.transition_to(cls.ARMING, reason="Explicit Initial Provisioning")
+        fsm.transition_to(cls.ACTIVE, reason="Explicit Initial Provisioning Complete")
+        return fsm
+
+    @staticmethod
+    def _validate_regular_file_security(path: str, *, check_mode_0600: bool = False) -> os.stat_result:
+        """Reject symlinks, non-regular files, hard links (nlink > 1), UID mismatch, and permissive modes (Section 3 Req 9)."""
+        parent = os.path.dirname(path)
+        if parent and os.path.islink(parent):
+            raise PermissionError(f"Parent directory is a symlink: {parent}")
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            raise PermissionError(f"Symlink prohibited for FSM file: {path}")
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"Path is not a regular file: {path}")
+        if st.st_nlink > 1:
+            raise PermissionError(f"Hard link prohibited for FSM file (nlink={st.st_nlink}): {path}")
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            raise PermissionError(f"File owner UID mismatch on {path}")
+        if check_mode_0600 and (st.st_mode & 0o077):
+            raise PermissionError(f"File permissions too permissive on {path}: {oct(st.st_mode & 0o777)}")
+        return st
+
     def _init_hmac_key(self, hmac_key: bytes | str | None) -> None:
-        """Initialize HMAC key securely without any hardcoded fallback key (P1-001)."""
+        """Initialize HMAC key securely and enforce mandatory 2-line Key+SEAL verification (Sections 2 & 3, I-06, I-17)."""
         raw_candidate: bytes | None = None
         env_key = os.environ.get("MK1_FSM_HMAC_KEY")
 
@@ -723,6 +1661,7 @@ class MK1SafetyStateMachine:
                 log.critical("[FSM] 脆弱または禁止された固定HMAC鍵が指定されました。Fail-Closedを適用します。")
                 self._hmac_key = secrets.token_bytes(32)
                 self._key_security_failed = True
+                self._key_failure_reason = "FAILED_KEY_SECURITY"
                 return
             self._hmac_key = hashlib.sha256(b"MK1AI-FSM-KEY-V3.2:" + raw_candidate).digest()
             return
@@ -733,29 +1672,49 @@ class MK1SafetyStateMachine:
                 log.critical("[FSM] 環境変数 MK1_FSM_HMAC_KEY が脆弱または禁止された固定鍵です。Fail-Closedを適用します。")
                 self._hmac_key = secrets.token_bytes(32)
                 self._key_security_failed = True
+                self._key_failure_reason = "FAILED_KEY_SECURITY"
                 return
             self._hmac_key = hashlib.sha256(b"MK1AI-FSM-KEY-V3.2:" + raw_candidate).digest()
             return
 
         if self._key_path is not None:
-            state_or_journal_exists = bool(
-                (self._state_path and os.path.exists(self._state_path))
-                or (self._journal_path and os.path.exists(self._journal_path))
+            state_or_journal_or_anchor_exists = bool(
+                (self._state_path and os.path.lexists(self._state_path))
+                or (self._journal_path and os.path.lexists(self._journal_path))
+                or (self._anchor_path and os.path.lexists(self._anchor_path))
+                or (self._external_seal_path and os.path.lexists(self._external_seal_path))
+                or self._storage_dirs_existed_at_boot
             )
-            if os.path.exists(self._key_path):
+            if self._state_path:
+                with _GLOBAL_PROVISIONED_STORAGE_LOCK:
+                    if self._state_path in _GLOBAL_PROVISIONED_STORAGE_LEDGER:
+                        state_or_journal_or_anchor_exists = True
+
+            if os.path.lexists(self._key_path):
                 try:
-                    st = os.stat(self._key_path)
-                    if not stat.S_ISREG(st.st_mode):
-                        raise PermissionError("HMAC key path is not a regular file")
-                    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
-                        raise PermissionError("HMAC key file owner UID mismatch")
-                    if st.st_mode & 0o077:
-                        raise PermissionError(f"HMAC key file permissions too permissive: {oct(st.st_mode & 0o777)}")
+                    self._validate_regular_file_security(self._key_path, check_mode_0600=True)
                     with open(self._key_path, "rb") as kf:
-                        key_bytes = kf.read().strip()
+                        lines = [ln.strip() for ln in kf.read().splitlines() if ln.strip()]
+                    if not lines:
+                        self._key_failure_reason = "FAILED_KEY_SECURITY"
+                        raise ValueError("HMAC key file is empty")
+                    key_bytes = lines[0]
                     if len(key_bytes) < 32 or key_bytes in _FORBIDDEN_WEAK_HMAC_KEYS:
+                        self._key_failure_reason = "FAILED_KEY_SECURITY"
                         raise ValueError("HMAC key file content is too short or forbidden")
-                    self._hmac_key = hashlib.sha256(b"MK1AI-FSM-KEY-V3.2:" + key_bytes).digest()
+                    derived = hashlib.sha256(b"MK1AI-FSM-KEY-V3.2:" + key_bytes).digest()
+                    # Section 2 Mandatory Fix: Missing SEAL line (len(lines) < 2) is NEVER treated as unprovisioned!
+                    if len(lines) < 2:
+                        self._key_failure_reason = "FAILED_SEAL_MISSING"
+                        raise ValueError("Mandatory SEAL line is missing from HMAC key file (SEAL deletion detected)")
+                    if len(lines) > 2:
+                        self._key_failure_reason = "FAILED_SEAL_TAMPER"
+                        raise ValueError("Unexpected extra lines in HMAC key file")
+                    _, _, _, seal_ok, seal_reason = MonotonicCounterAnchor.classify_and_verify_key_seal(derived, lines[1])
+                    if not seal_ok:
+                        self._key_failure_reason = "FAILED_SEAL_TAMPER"
+                        raise ValueError(f"Key-embedded provisioning seal verification failed: {seal_reason}")
+                    self._hmac_key = derived
                     return
                 except Exception as exc:
                     log.critical(f"[FSM] HMAC鍵ファイル検証失敗 ({exc})。Fail-ClosedでISOLATEDに移行します。")
@@ -763,47 +1722,61 @@ class MK1SafetyStateMachine:
                     self._key_security_failed = True
                     return
             else:
-                if state_or_journal_exists:
-                    log.critical("[FSM] 永続状態ファイルが存在しますがHMAC鍵ファイルが欠損しています。Fail-Closedを適用します。")
+                if state_or_journal_or_anchor_exists or not self._allow_initial_provisioning or self._require_existing_state:
+                    log.critical("[FSM] 永続データまたはプロビジョニング要求が存在しますがHMAC鍵ファイルが欠損しています。自動初期化を禁止しFail-Closedを適用します。")
                     self._hmac_key = secrets.token_bytes(32)
                     self._key_security_failed = True
+                    self._key_failure_reason = (
+                        "FAILED_STORAGE_WIPE" if state_or_journal_or_anchor_exists else "FAILED_UNPROVISIONED_STORAGE"
+                    )
                     return
                 try:
                     parent = os.path.dirname(self._key_path)
                     if parent:
+                        if os.path.islink(parent):
+                            raise PermissionError(f"Key directory is a symlink: {parent}")
                         os.makedirs(parent, exist_ok=True)
                     generated = secrets.token_hex(32).encode("ascii")
-                    fd, tmp_k = tempfile.mkstemp(prefix=".key.", suffix=".tmp", dir=parent or None)
+                    derived = hashlib.sha256(b"MK1AI-FSM-KEY-V3.2:" + generated).digest()
+                    initial_seal = MonotonicCounterAnchor.format_key_seal_line(derived, False, 0, "OFF")
+                    fd, tmp_k = tempfile.mkstemp(
+                        prefix=f".key.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.",
+                        suffix=".tmp",
+                        dir=parent or None,
+                    )
                     try:
                         with os.fdopen(fd, "wb") as kf:
-                            kf.write(generated)
+                            kf.write(generated + b"\n" + initial_seal + b"\n")
                             kf.flush()
                             os.fsync(kf.fileno())
                         os.chmod(tmp_k, 0o600)
                         os.replace(tmp_k, self._key_path)
+                        self._fsync_parent_dir(self._key_path)
                     finally:
                         if os.path.exists(tmp_k):
                             try:
                                 os.unlink(tmp_k)
                             except OSError:
                                 pass
-                    self._hmac_key = hashlib.sha256(b"MK1AI-FSM-KEY-V3.2:" + generated).digest()
+                    self._hmac_key = derived
                     return
                 except Exception as exc:
                     log.critical(f"[FSM] HMAC鍵ファイル生成失敗 ({exc})。Fail-Closedを適用します。")
                     self._hmac_key = secrets.token_bytes(32)
                     self._key_security_failed = True
+                    self._key_failure_reason = "FAILED_KEY_SECURITY"
                     return
 
         # Ephemeral in-memory instance: generate unique 256-bit CSPRNG key
         self._hmac_key = secrets.token_bytes(32)
 
     def rotate_hmac_key(self, new_key: bytes | str) -> bool:
-        """Cryptographically rotate the FSM HMAC key and re-sign persistent state & journal atomically (P1-001)."""
+        """Cryptographically rotate the FSM HMAC key and re-sign persistent state, journal, anchor & key seal atomically (P1-001)."""
         raw_new = new_key.encode("utf-8") if isinstance(new_key, str) else bytes(new_key)
         if raw_new in _FORBIDDEN_WEAK_HMAC_KEYS or len(raw_new) < 16:
             raise ValueError("New HMAC key must be at least 16 bytes and not a forbidden weak key")
-        derived_new = hashlib.sha256(b"MK1AI-FSM-KEY-V3.2:" + raw_new).digest()
+        stored_raw = raw_new if len(raw_new) >= 32 else hashlib.sha256(raw_new).hexdigest().encode("ascii")
+        derived_new = hashlib.sha256(b"MK1AI-FSM-KEY-V3.2:" + stored_raw).digest()
         with self._acquire_lock():
             old_key = self._hmac_key
             self._hmac_key = derived_new
@@ -811,15 +1784,28 @@ class MK1SafetyStateMachine:
                 try:
                     parent = os.path.dirname(self._key_path)
                     if parent:
+                        if os.path.islink(parent):
+                            raise PermissionError(f"Key parent directory is a symlink: {parent}")
                         os.makedirs(parent, exist_ok=True)
-                    fd, tmp_k = tempfile.mkstemp(prefix=".key.rot.", suffix=".tmp", dir=parent or None)
+                    seal_line = MonotonicCounterAnchor.format_key_seal_line(
+                        derived_new,
+                        self._generation > 0,
+                        self._generation,
+                        self._state,
+                    )
+                    fd, tmp_k = tempfile.mkstemp(
+                        prefix=f".key.rot.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.",
+                        suffix=".tmp",
+                        dir=parent or None,
+                    )
                     try:
                         with os.fdopen(fd, "wb") as kf:
-                            kf.write(raw_new if len(raw_new) >= 32 else hashlib.sha256(raw_new).hexdigest().encode("ascii"))
+                            kf.write(stored_raw + b"\n" + seal_line + b"\n")
                             kf.flush()
                             os.fsync(kf.fileno())
                         os.chmod(tmp_k, 0o600)
                         os.replace(tmp_k, self._key_path)
+                        self._fsync_parent_dir(self._key_path)
                     finally:
                         if os.path.exists(tmp_k):
                             try:
@@ -838,12 +1824,13 @@ class MK1SafetyStateMachine:
             return True
 
     class _TimedLockContext:
-        """Two-level hierarchical lock: in-process RLock + OS cross-process file lock (fcntl.flock) (P1-004, R-001).
+        """Two-level hierarchical lock: in-process RLock + mandatory OS cross-process file lock (fcntl.flock) (Section 4, R-001, I-08).
 
-        Enforces strict thread ownership and reentrancy tracking:
+        Enforces strict fail-closed semantics:
         - Nested acquisitions by the owning thread increment _flock_depth without re-opening or re-flocking.
-        - Only the outermost acquisition (depth 0 -> 1) acquires the OS-level fcntl.flock.
-        - Only the outermost release (depth 1 -> 0) unlocks and closes the OS-level fcntl.flock.
+        - Outermost acquisition (depth 0 -> 1) MUST acquire OS-level fcntl.flock when _lock_path is set.
+        - If opening the lock file, validating its inode/permissions, or acquiring flock fails,
+          it NEVER continues with a warning; it releases _rlock, records an audit event, and raises FSMLockError/TimeoutError.
         """
 
         def __init__(self, fsm: "MK1SafetyStateMachine", timeout: float):
@@ -856,7 +1843,8 @@ class MK1SafetyStateMachine:
             deadline = time.monotonic() + self._timeout
             self._acquired_rlock = self._rlock.acquire(timeout=self._timeout)
             if not self._acquired_rlock:
-                raise TimeoutError("FSM lock acquisition timed out (potential deadlock prevented)")
+                self._fsm._record_audit("LOCK_TIMEOUT", self._fsm._state, self._fsm._state, "In-process RLock timeout")
+                raise FSMLockError("FSM lock acquisition timed out (potential deadlock prevented)")
 
             tid = threading.get_ident()
             if self._fsm._flock_depth > 0:
@@ -869,20 +1857,40 @@ class MK1SafetyStateMachine:
                 self._fsm._flock_depth += 1
                 return self
 
-            # Outermost acquisition (depth 0 -> 1): acquire OS-level fcntl.flock if state_path is configured
+            # Outermost acquisition (depth 0 -> 1): mandatory OS-level fcntl.flock if _lock_path is configured
             fd: int | None = None
-            if self._fsm._lock_path and _fcntl_mod is not None:
+            if self._fsm._lock_path:
+                if _fcntl_mod is None:
+                    self._rlock.release()
+                    self._acquired_rlock = False
+                    self._fsm._record_audit("LOCK_ACQUISITION_FAILED", self._fsm._state, self._fsm._state, "fcntl module unavailable")
+                    raise FSMLockError("OS inter-process locking (fcntl) is unavailable")
                 try:
                     parent = os.path.dirname(self._fsm._lock_path)
                     if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    fd = os.open(self._fsm._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                        if os.path.islink(parent):
+                            raise PermissionError(f"Lock file parent directory is a symlink: {parent}")
+                        if not os.path.isdir(parent):
+                            raise FileNotFoundError(f"Lock file parent directory does not exist: {parent}")
+                    if os.path.lexists(self._fsm._lock_path):
+                        lst = os.lstat(self._fsm._lock_path)
+                        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode) or lst.st_nlink > 1:
+                            raise PermissionError(f"Lock file is a symlink, non-regular file, or hard link: {self._fsm._lock_path}")
+                    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                    fd = os.open(self._fsm._lock_path, open_flags, 0o600)
+                    fst = os.fstat(fd)
+                    if not stat.S_ISREG(fst.st_mode) or fst.st_nlink > 1:
+                        raise PermissionError("Opened lock file descriptor failed regular/nlink check")
                     while True:
                         try:
                             _fcntl_mod.flock(fd, _fcntl_mod.LOCK_EX | _fcntl_mod.LOCK_NB)
                             self._fsm._flock_fd = fd
                             break
-                        except (BlockingIOError, IOError):
+                        except (BlockingIOError, IOError) as flock_exc:
+                            # Distinguish EAGAIN/EWOULDBLOCK contention from hard flock/EBADF/ENOLCK errors
+                            err_no = getattr(flock_exc, "errno", None)
+                            if err_no not in (None, 11, 35):  # EAGAIN=11, EWOULDBLOCK=11/35
+                                raise FSMLockError(f"OS flock system error (errno={err_no}): {flock_exc}") from flock_exc
                             if time.monotonic() >= deadline:
                                 try:
                                     os.close(fd)
@@ -890,9 +1898,16 @@ class MK1SafetyStateMachine:
                                     pass
                                 self._rlock.release()
                                 self._acquired_rlock = False
-                                raise TimeoutError("FSM inter-process file lock timed out")
+                                self._fsm._record_audit("LOCK_TIMEOUT", self._fsm._state, self._fsm._state, "Inter-process flock timed out")
+                                raise FSMLockError("FSM inter-process file lock timed out")
                             time.sleep(0.001)
-                except TimeoutError:
+                except FSMLockError:
+                    self._fsm._flock_fd = None
+                    self._fsm._flock_depth = 0
+                    self._fsm._flock_owner_tid = None
+                    if self._acquired_rlock:
+                        self._rlock.release()
+                        self._acquired_rlock = False
                     raise
                 except Exception as exc:
                     if fd is not None:
@@ -901,7 +1916,13 @@ class MK1SafetyStateMachine:
                         except OSError:
                             pass
                     self._fsm._flock_fd = None
-                    log.warning(f"[FSM] プロセス間ロック取得警告 ({exc})")
+                    self._fsm._flock_depth = 0
+                    self._fsm._flock_owner_tid = None
+                    self._rlock.release()
+                    self._acquired_rlock = False
+                    self._fsm._record_audit("LOCK_ACQUISITION_FAILED", self._fsm._state, self._fsm._state, f"OS lock failed: {exc}")
+                    log.critical(f"[FSM] プロセス間ロック取得失敗 ({exc})。ロック無しでの処理継続を禁止します。")
+                    raise FSMLockError(f"FSM inter-process lock acquisition failed: {exc}") from exc
 
             self._fsm._flock_owner_tid = tid
             self._fsm._flock_depth = 1
@@ -909,6 +1930,7 @@ class MK1SafetyStateMachine:
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             if self._acquired_rlock:
+                unlock_err: Exception | None = None
                 try:
                     if self._fsm._flock_depth > 1:
                         self._fsm._flock_depth -= 1
@@ -921,12 +1943,15 @@ class MK1SafetyStateMachine:
                             try:
                                 if _fcntl_mod is not None:
                                     _fcntl_mod.flock(fd_to_close, _fcntl_mod.LOCK_UN)
-                            except OSError:
-                                pass
+                            except OSError as u_exc:
+                                unlock_err = u_exc
+                                self._fsm._record_audit("LOCK_RELEASE_ERROR", self._fsm._state, self._fsm._state, f"flock unlock error: {u_exc}")
                             try:
                                 os.close(fd_to_close)
-                            except OSError:
-                                pass
+                            except OSError as c_exc:
+                                if unlock_err is None:
+                                    unlock_err = c_exc
+                                self._fsm._record_audit("LOCK_RELEASE_ERROR", self._fsm._state, self._fsm._state, f"lock fd close error: {c_exc}")
                 finally:
                     self._rlock.release()
                     self._acquired_rlock = False
@@ -975,17 +2000,45 @@ class MK1SafetyStateMachine:
 
     @staticmethod
     def _fsync_parent_dir(file_path: str | None) -> None:
+        """Fsync parent directory and propagate any OSError so directory fsync failure never returns commit success (Section 5 / I-09)."""
         if not file_path:
             return
         parent = os.path.dirname(file_path)
         if not parent or not os.path.isdir(parent):
             return
+        dfd = os.open(parent, os.O_RDONLY)
         try:
-            dfd = os.open(parent, os.O_RDONLY)
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+    @classmethod
+    def _atomic_restore_bytes(cls, target_path: str | None, content: bytes | None) -> None:
+        """Atomically restore snapshot bytes via temp file + fsync + replace + dir fsync without truncating target in-place."""
+        if not target_path or content is None:
+            return
+        try:
+            parent_dir = os.path.dirname(target_path)
+            base = os.path.basename(target_path)
+            fd, tmp_r = tempfile.mkstemp(
+                prefix=f".restore.{base}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.",
+                suffix=".tmp",
+                dir=parent_dir or None,
+            )
             try:
-                os.fsync(dfd)
+                with os.fdopen(fd, "wb") as rf:
+                    rf.write(content)
+                    rf.flush()
+                    os.fsync(rf.fileno())
+                os.chmod(tmp_r, 0o600)
+                os.replace(tmp_r, target_path)
+                cls._fsync_parent_dir(target_path)
             finally:
-                os.close(dfd)
+                if os.path.exists(tmp_r):
+                    try:
+                        os.unlink(tmp_r)
+                    except OSError:
+                        pass
         except OSError:
             pass
 
@@ -1001,7 +2054,7 @@ class MK1SafetyStateMachine:
                 if fname.startswith(f".{base}.") and fname.endswith(".tmp"):
                     fpath = os.path.join(parent, fname)
                     try:
-                        st = os.stat(fpath)
+                        st = os.lstat(fpath)
                         if time.time() - st.st_mtime > 60.0:
                             os.unlink(fpath)
                     except OSError:
@@ -1016,11 +2069,12 @@ class MK1SafetyStateMachine:
         - 'VERIFIED': Valid COMMITTED journal record.
         - 'PREPARED_INCOMPLETE': Valid PREPARED journal record (interrupted uncommitted WAL transaction).
         - 'MISSING': Journal file does not exist.
-        - 'CORRUPTED': Malformed JSON, invalid schema, or HMAC mismatch.
+        - 'CORRUPTED': Malformed JSON, invalid schema, symlink/hardlink violation, or HMAC mismatch.
         """
-        if not self._journal_path or not os.path.isfile(self._journal_path):
+        if not self._journal_path or not os.path.lexists(self._journal_path):
             return (0, None, "MISSING")
         try:
+            self._validate_regular_file_security(self._journal_path)
             with open(self._journal_path, "r", encoding="utf-8") as jf:
                 jdata = json.load(jf)
             if not isinstance(jdata, dict):
@@ -1042,7 +2096,6 @@ class MK1SafetyStateMachine:
                 raise ValueError("Invalid journal schema")
             expected_jmac = self._compute_journal_mac(max_gen, jstate, status=jstatus)
             if not hmac.compare_digest(expected_jmac, jmac):
-                # Backward-compatibility check for legacy V3.2 records without status field in MAC
                 legacy_jmac = hmac.new(self._hmac_key, f"JOURNAL:{max_gen}:{jstate}".encode("utf-8"), hashlib.sha256).hexdigest()
                 if not ("status" not in jdata and hmac.compare_digest(legacy_jmac, jmac)):
                     raise ValueError("Journal HMAC verification failed")
@@ -1066,7 +2119,7 @@ class MK1SafetyStateMachine:
         prev_generation: int | None = None,
         prev_state: str | None = None,
     ) -> bool:
-        """Write and fsync a PREPARED or COMMITTED WAL record to the journal file (R-002)."""
+        """Write, file-fsync, os.replace, and parent-dir-fsync a PREPARED or COMMITTED WAL record (Section 5, R-002)."""
         if self._simulate_journal_failure:
             log.error("[FSM] シミュレーションされたジャーナル書き込み失敗が発生しました。")
             return False
@@ -1078,7 +2131,11 @@ class MK1SafetyStateMachine:
         try:
             parent_dir = os.path.dirname(self._journal_path)
             if parent_dir:
+                if os.path.islink(parent_dir):
+                    raise PermissionError(f"Journal parent directory is a symlink: {parent_dir}")
                 os.makedirs(parent_dir, exist_ok=True)
+            if os.path.lexists(self._journal_path):
+                self._validate_regular_file_security(self._journal_path)
             high_water = max(generation, self._max_observed_generation)
             jdata: dict[str, Any] = {
                 "version": "3.2",
@@ -1094,7 +2151,7 @@ class MK1SafetyStateMachine:
 
             jbase = os.path.basename(self._journal_path)
             fd, tmp_j = tempfile.mkstemp(
-                prefix=f".{jbase}.{os.getpid()}.{threading.get_ident()}.",
+                prefix=f".{jbase}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.{secrets.token_hex(4)}.",
                 suffix=".tmp",
                 dir=parent_dir or None,
             )
@@ -1103,6 +2160,7 @@ class MK1SafetyStateMachine:
                     json.dump(jdata, jf, sort_keys=True)
                     jf.flush()
                     os.fsync(jf.fileno())
+                os.chmod(tmp_j, 0o600)
                 os.replace(tmp_j, self._journal_path)
                 self._fsync_parent_dir(self._journal_path)
             finally:
@@ -1126,13 +2184,17 @@ class MK1SafetyStateMachine:
     def _write_journal_max_generation(self, generation: int, state: str) -> bool:
         return self._write_journal_record(generation, state, status="COMMITTED")
 
+    def _write_journal_entry(self, generation: int, state: str, *, wal_status: str = "COMMITTED") -> bool:
+        return self._write_journal_record(generation, state, status=wal_status)
+
     def _verify_committed_storage_consistency(self, expected_gen: int, expected_state: str) -> bool:
-        """Step 7 of R-002 WAL: Verify on-disk State and Journal match COMMITTED target state and generation."""
+        """Step 10 of WAL: Verify on-disk State, Journal (COMMITTED), Anchor, Key SEAL, and TPM match target state and generation."""
         if not self._state_path:
             return True
         try:
-            if not os.path.isfile(self._state_path):
+            if not os.path.lexists(self._state_path):
                 return False
+            self._validate_regular_file_security(self._state_path)
             with open(self._state_path, "r", encoding="utf-8") as sf:
                 sdata = json.load(sf)
             if not isinstance(sdata, dict):
@@ -1151,18 +2213,27 @@ class MK1SafetyStateMachine:
                 j_gen, j_state, j_status = self._read_journal_record()
                 if j_status != "VERIFIED" or j_gen != expected_gen or j_state != expected_state:
                     return False
+            layers_ok, _ = self._anchor.verify_layer_consistency(expected_gen, expected_state)
+            if not layers_ok:
+                return False
             return True
         except Exception:
             return False
 
     def _sync_from_disk_if_newer_locked(self) -> None:
-        """Synchronize generation/state from disk under inter-process lock when another OS process has advanced generation."""
-        if not self._state_path or not os.path.isfile(self._state_path):
+        """Synchronize generation/state from disk under inter-process lock; fail-closed on corruption/uncommitted WAL."""
+        if not self._state_path or not os.path.lexists(self._state_path):
             return
         try:
-            if self._journal_path and os.path.isfile(self._journal_path):
+            self._validate_regular_file_security(self._state_path)
+            if self._journal_path and os.path.lexists(self._journal_path):
                 j_gen, _, j_status = self._read_journal_record()
                 if j_status in ("CORRUPTED", "PREPARED_INCOMPLETE"):
+                    self._state = self.ISOLATED
+                    self._simulated_state = self.ISOLATED
+                    self._authenticity_status = (
+                        "FAILED_WAL_INCOMPLETE" if j_status == "PREPARED_INCOMPLETE" else "FAILED_ROLLBACK"
+                    )
                     return
                 if j_gen > self._max_observed_generation:
                     self._max_observed_generation = j_gen
@@ -1194,11 +2265,19 @@ class MK1SafetyStateMachine:
                     tokens = data.get("consumed_tokens", [])
                     if isinstance(tokens, list):
                         self._consumed_recovery_tokens.update(str(t) for t in tokens)
+                else:
+                    self._state = self.ISOLATED
+                    self._simulated_state = self.ISOLATED
+                    self._authenticity_status = "FAILED_HMAC"
         except Exception:
-            pass
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
+            self._authenticity_status = "FAILED_LOAD"
 
     def _save_persistent_state(self) -> bool:
-        """Execute 7-Step 2-Phase WAL (PREPARED -> State Update -> COMMITTED -> Final Verification) (P1-002, P1-004, R-002)."""
+        """Execute 10-Step 2-Phase WAL with mandatory lock ownership and parent directory fsync verification (Sections 4 & 5, I-08, I-09)."""
+        if self._dry_run_only:
+            raise RuntimeError("Persistence write is prohibited on Dry-Run FSM instance (Section 3 / I-14)")
         if self._persistence_io_delay_sec > 0.0:
             time.sleep(self._persistence_io_delay_sec)
         if self._simulate_persistence_failure:
@@ -1209,6 +2288,37 @@ class MK1SafetyStateMachine:
             self._wal_status = "COMMITTED"
             self._authenticity_status = "VERIFIED"
             return True
+
+        # Section 4 / I-08: Never allow State, Journal, or Anchor persistence without holding the OS inter-process lock
+        try:
+            with self._acquire_lock():
+                return self._save_persistent_state_locked()
+        except (FSMLockError, TimeoutError) as lock_exc:
+            log.critical(f"[FSM] 永続化ロック取得失敗のためState/Journal/Anchor更新を拒否します: {lock_exc}")
+            self._authenticity_status = "FAILED_LOCK"
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
+            return False
+
+    def _save_persistent_state_locked(self) -> bool:
+        if self._dry_run_only:
+            raise RuntimeError("Persistence write is prohibited on Dry-Run FSM instance (Section 3 / I-14)")
+        if self._persistence_io_delay_sec > 0.0:
+            time.sleep(self._persistence_io_delay_sec)
+        if self._simulate_persistence_failure:
+            log.error("[FSM] シミュレーションされた永続化失敗が発生しました。")
+            self._authenticity_status = "FAILED_PERSISTENCE"
+            return False
+        if not self._state_path:
+            self._wal_status = "COMMITTED"
+            self._authenticity_status = "VERIFIED"
+            return True
+        if self._lock_path and _fcntl_mod is not None:
+            if self._flock_depth < 1 or self._flock_fd is None or self._flock_owner_tid != threading.get_ident():
+                self._authenticity_status = "FAILED_LOCK"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return False
 
         prev_journal_snapshot: bytes | None = None
         if self._journal_path and os.path.isfile(self._journal_path):
@@ -1229,7 +2339,16 @@ class MK1SafetyStateMachine:
         try:
             parent_dir = os.path.dirname(self._state_path)
             if parent_dir:
+                if os.path.islink(parent_dir):
+                    raise PermissionError(f"State parent directory is a symlink: {parent_dir}")
                 os.makedirs(parent_dir, exist_ok=True)
+            if os.path.lexists(self._state_path):
+                self._validate_regular_file_security(self._state_path)
+
+            if self._generation < 1:
+                self._generation = 1
+            self._max_observed_generation = max(self._max_observed_generation, self._generation)
+
             ts = time.time()
             sig = self._compute_integrity(self._state, ts, self._generation)
             data = {
@@ -1242,7 +2361,7 @@ class MK1SafetyStateMachine:
                 "integrity": sig,
             }
 
-            # Step 1 & Step 2: Write PREPARED record to WAL Journal and fsync
+            # Steps 1, 2, 3: Create PREPARED record, fsync WAL file, replace, and fsync WAL parent directory
             if not self._write_journal_record(
                 self._generation,
                 self._state,
@@ -1257,10 +2376,10 @@ class MK1SafetyStateMachine:
             if callable(self._wal_fault_hook):
                 self._wal_fault_hook("AFTER_PREPARED_FSYNC")
 
-            # Step 3 & Step 4: Write State to PID/TID unique temp file, fsync, and os.replace
+            # Steps 4, 5, 6: Write State to collision-free temp file, fsync State file, os.replace, and fsync State parent directory
             sbase = os.path.basename(self._state_path)
             fd, tmp_path = tempfile.mkstemp(
-                prefix=f".{sbase}.{os.getpid()}.{threading.get_ident()}.",
+                prefix=f".{sbase}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.{secrets.token_hex(4)}.",
                 suffix=".tmp",
                 dir=parent_dir or None,
             )
@@ -1271,6 +2390,7 @@ class MK1SafetyStateMachine:
                     if callable(self._wal_fault_hook):
                         self._wal_fault_hook("BEFORE_STATE_FSYNC")
                     os.fsync(f.fileno())
+                os.chmod(tmp_path, 0o600)
                 if callable(self._wal_fault_hook):
                     self._wal_fault_hook("BEFORE_STATE_REPLACE")
                 os.replace(tmp_path, self._state_path)
@@ -1281,47 +2401,28 @@ class MK1SafetyStateMachine:
                         os.unlink(tmp_path)
                     except OSError:
                         pass
-                # Restore previous committed journal snapshot if state write/replace failed
                 if self._journal_path and prev_journal_snapshot is not None:
-                    try:
-                        with open(self._journal_path, "wb") as jf:
-                            jf.write(prev_journal_snapshot)
-                            jf.flush()
-                            os.fsync(jf.fileno())
-                        self._wal_status = "COMMITTED"
-                    except OSError:
-                        pass
+                    self._atomic_restore_bytes(self._journal_path, prev_journal_snapshot)
+                    self._wal_status = "COMMITTED"
                 raise
 
             if callable(self._wal_fault_hook):
                 self._wal_fault_hook("AFTER_STATE_REPLACE_BEFORE_COMMITTED")
+                self._wal_fault_hook("BEFORE_ANCHOR_AND_SEAL_UPDATE")
 
-            # Step 5 & Step 6: Write COMMITTED record to WAL Journal and fsync
-            if not self._write_journal_record(self._generation, self._state, status="COMMITTED"):
-                # Rollback state & journal if COMMITTED write failed
-                if prev_state_snapshot is not None:
-                    try:
-                        with open(self._state_path, "wb") as sf:
-                            sf.write(prev_state_snapshot)
-                            sf.flush()
-                            os.fsync(sf.fileno())
-                    except OSError:
-                        pass
-                if self._journal_path and prev_journal_snapshot is not None:
-                    try:
-                        with open(self._journal_path, "wb") as jf:
-                            jf.write(prev_journal_snapshot)
-                            jf.flush()
-                            os.fsync(jf.fileno())
-                    except OSError:
-                        pass
+            # Step 7: Update provisioning boot anchor, key-embedded SEAL, and TPM NVRAM counter
+            if not self._anchor.write_anchor(self._generation, self._state):
+                self._atomic_restore_bytes(self._state_path, prev_state_snapshot)
+                self._atomic_restore_bytes(self._journal_path, prev_journal_snapshot)
                 self._authenticity_status = "FAILED_PERSISTENCE"
                 self._state = self.ISOLATED
                 self._simulated_state = self.ISOLATED
                 return False
 
-            # Update provisioning boot anchor
-            if not self._anchor.write_anchor(self._generation, self._state):
+            # Steps 8 & 9: Write COMMITTED record to Journal, fsync Journal file, replace, and fsync Journal parent directory
+            if not self._write_journal_record(self._generation, self._state, status="COMMITTED"):
+                self._atomic_restore_bytes(self._state_path, prev_state_snapshot)
+                self._atomic_restore_bytes(self._journal_path, prev_journal_snapshot)
                 self._authenticity_status = "FAILED_PERSISTENCE"
                 self._state = self.ISOLATED
                 self._simulated_state = self.ISOLATED
@@ -1330,9 +2431,9 @@ class MK1SafetyStateMachine:
             if callable(self._wal_fault_hook):
                 self._wal_fault_hook("BEFORE_FINAL_VERIFICATION")
 
-            # Step 7: Final State & Journal Cross-Verification
+            # Step 10: Final State, Journal, Anchor, Key SEAL, and TPM Cross-Verification
             if not self._verify_committed_storage_consistency(self._generation, self._state):
-                log.critical("[FSM] Step 7 最終永続化照合に失敗しました。Fail-Closed を適用します。")
+                log.critical("[FSM] Step 10 最終永続化照合に失敗しました。Fail-Closed を適用します。")
                 self._authenticity_status = "FAILED_PERSISTENCE"
                 self._state = self.ISOLATED
                 self._simulated_state = self.ISOLATED
@@ -1348,228 +2449,315 @@ class MK1SafetyStateMachine:
             return False
 
     def _load_persistent_state(self) -> None:
-        """Load and cross-verify State, Journal (COMMITTED vs PREPARED), and Boot Anchor with Fail-Closed guarantees (P0-001, P0-004, P1-003, P2-002, P2-003, R-002)."""
+        """Load and cross-verify State, Journal (COMMITTED vs PREPARED), Boot Anchor, Key SEAL, and TPM with Fail-Closed guarantees."""
         if not self._state_path:
             return
-        with self._acquire_lock():
-            self._cleanup_stale_temp_files()
-            state_exists = os.path.isfile(self._state_path)
-            journal_exists = bool(self._journal_path and os.path.isfile(self._journal_path))
-            anchor_exists = self._anchor.exists()
+        try:
+            with self._acquire_lock():
+                self._load_persistent_state_locked()
+        except Exception as exc:
+            log.critical(f"[FSM] 起動時ロック取得または永続状態検証失敗 ({exc})。Fail-Closed により ISOLATED に固定します。")
+            self._authenticity_status = "FAILED_LOCK" if isinstance(exc, (FSMLockError, TimeoutError)) else "FAILED_LOAD"
+            self._rollback_protection_status = "LOCK_OR_LOAD_ERROR"
+            self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
 
-            # Case 0: Fresh unprovisioned storage
-            if not state_exists and not journal_exists:
-                if anchor_exists or self._require_existing_state:
-                    log.critical("[FSM] 永続StateおよびJournalの両方が削除されています(Storage Wipe検知)！ Fail-ClosedによりISOLATEDに固定します。")
-                    _, anchor_gen, _, _ = self._anchor.read_anchor()
-                    self._generation = max(1, anchor_gen)
-                    self._max_observed_generation = self._generation
+    def _load_persistent_state_locked(self) -> None:
+        if not self._state_path:
+            return
+        self._cleanup_stale_temp_files()
+        state_exists = os.path.lexists(self._state_path)
+        journal_exists = bool(self._journal_path and os.path.lexists(self._journal_path))
+        anchor_file_exists = bool(self._anchor_path and os.path.lexists(self._anchor_path))
+        anchor_exists = self._anchor.exists()
+
+        # Case 0: Neither State nor Journal exists
+        if not state_exists and not journal_exists:
+            if (
+                anchor_exists
+                or anchor_file_exists
+                or self._key_existed_at_boot
+                or self._storage_dirs_existed_at_boot
+                or self._require_existing_state
+                or not self._allow_initial_provisioning
+            ):
+                log.critical(
+                    "[FSM] 永続StateおよびJournalが存在しません(Storage Wipe / 部分残存 / 未承認初期化検知)！ "
+                    "自動初期化を禁止し、Fail-ClosedによりISOLATEDに固定します。"
+                )
+                _, anchor_gen, _, _ = self._anchor.read_anchor()
+                self._generation = max(1, anchor_gen if anchor_gen < 2**60 else 1)
+                self._max_observed_generation = self._generation
+                if anchor_exists or anchor_file_exists or self._key_existed_at_boot or self._storage_dirs_existed_at_boot:
                     self._authenticity_status = "FAILED_STORAGE_WIPE"
                     self._rollback_protection_status = "VIOLATION_STORAGE_WIPE"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-                self._boot_integrity_status = "CLEAN_INIT"
+                else:
+                    self._authenticity_status = "FAILED_UNPROVISIONED_STORAGE"
+                    self._rollback_protection_status = "UNPROVISIONED_AUTO_INIT_FORBIDDEN"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
                 return
+            self._boot_integrity_status = "CLEAN_INIT"
+            return
 
-            # Case 1: State file deleted while Journal exists (P0-004)
-            if not state_exists and journal_exists:
-                j_gen, _, j_status = self._read_journal_record()
-                log.critical("[FSM] 永続Stateファイルが欠損しています(Journalは存在)！ Fail-ClosedによりISOLATEDに固定します。")
-                self._generation = max(1, j_gen if j_status in ("VERIFIED", "PREPARED_INCOMPLETE") else 1)
-                self._max_observed_generation = self._generation
-                self._authenticity_status = "FAILED_MISSING_STATE"
-                self._rollback_protection_status = "VIOLATION_MISSING_STATE"
+        # Case 1: State file deleted while Journal exists (P0-004)
+        if not state_exists and journal_exists:
+            j_gen, _, j_status = self._read_journal_record()
+            log.critical("[FSM] 永続Stateファイルが欠損しています(Journalは存在)！ Fail-ClosedによりISOLATEDに固定します。")
+            self._generation = max(1, j_gen if j_status in ("VERIFIED", "PREPARED_INCOMPLETE") else 1)
+            self._max_observed_generation = self._generation
+            self._authenticity_status = "FAILED_MISSING_STATE"
+            self._rollback_protection_status = "VIOLATION_MISSING_STATE"
+            self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
+            return
+
+        try:
+            self._validate_regular_file_security(self._state_path)
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or "hmac_key" in data or "secret_key" in data:
+                raise ValueError("Forbidden key material or invalid structure in FSM state file")
+            if "generation" not in data:
+                raise ValueError("Missing mandatory generation field in FSM persistent state")
+            state = data.get("state")
+            raw_ts = data.get("timestamp")
+            gen = data.get("generation")
+            sig = data.get("integrity")
+            if (
+                not isinstance(state, str)
+                or isinstance(gen, bool)
+                or not isinstance(gen, int)
+                or gen < 1
+                or not isinstance(sig, str)
+            ):
+                raise ValueError("Incomplete or malformed FSM persistent state")
+            ts = self._validate_timestamp(raw_ts)
+
+            expected_sig = self._compute_integrity(state, raw_ts, gen)
+            if not hmac.compare_digest(expected_sig, sig):
+                log.critical("[FSM] 永続状態の改竄検知！ Fail-Closed により ISOLATED に固定します。")
+                self._authenticity_status = "FAILED_HMAC"
+                self._rollback_protection_status = "TAMPER_DETECTED"
                 self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
                 self._state = self.ISOLATED
                 self._simulated_state = self.ISOLATED
                 return
 
-            try:
-                with open(self._state_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict) or "hmac_key" in data or "secret_key" in data:
-                    raise ValueError("Forbidden key material or invalid structure in FSM state file")
-                if "generation" not in data:
-                    raise ValueError("Missing mandatory generation field in FSM persistent state")
-                state = data.get("state")
-                raw_ts = data.get("timestamp")
-                gen = data.get("generation")
-                sig = data.get("integrity")
-                if (
-                    not isinstance(state, str)
-                    or isinstance(gen, bool)
-                    or not isinstance(gen, int)
-                    or gen < 1
-                    or not isinstance(sig, str)
-                ):
-                    raise ValueError("Incomplete or malformed FSM persistent state")
-                ts = self._validate_timestamp(raw_ts)
+            if state not in self._allowed_transitions:
+                log.critical(f"[FSM] 未知の永続状態 '{state}' を検出。Fail-Closed により ISOLATED に固定します。")
+                self._authenticity_status = "FAILED_SCHEMA"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
 
-                expected_sig = self._compute_integrity(state, raw_ts, gen)
-                if not hmac.compare_digest(expected_sig, sig):
-                    log.critical("[FSM] 永続状態の改竄検知！ Fail-Closed により ISOLATED に固定します。")
-                    self._authenticity_status = "FAILED_HMAC"
-                    self._rollback_protection_status = "TAMPER_DETECTED"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-
-                if state not in self._allowed_transitions:
-                    log.critical(f"[FSM] 未知の永続状態 '{state}' を検出。Fail-Closed により ISOLATED に固定します。")
-                    self._authenticity_status = "FAILED_SCHEMA"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-
-                # Case 2: State exists & HMAC valid, but Journal file is missing (P0-004)
-                if self._journal_path and not journal_exists:
-                    log.critical("[FSM] 世代ジャーナルファイルが欠損しています！ ロールバック攻撃防止のため ISOLATED に固定します。")
-                    self._generation = gen
-                    self._max_observed_generation = gen
-                    self._authenticity_status = "FAILED_MISSING_JOURNAL"
-                    self._rollback_protection_status = "MISSING_JOURNAL"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-
-                # Case 3: Cross-check State vs Journal (COMMITTED vs PREPARED) & Anchor (P0-004, P1-003, R-002)
-                journal_max_gen, journal_last_state, journal_status = self._read_journal_record()
-                if journal_status == "CORRUPTED":
-                    self._authenticity_status = "FAILED_ROLLBACK"
-                    self._rollback_protection_status = "CORRUPTED_JOURNAL"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-
-                if journal_status == "PREPARED_INCOMPLETE":
-                    log.critical(
-                        f"[FSM] 未完了のWALトランザクション(status=PREPARED, journal_gen={journal_max_gen}, "
-                        f"state_gen={gen})を検知！ 不完全トランザクションからのACTIVE復元を禁止し、ISOLATEDに固定します。"
-                    )
-                    self._generation = max(gen, journal_max_gen)
-                    self._max_observed_generation = self._generation
-                    self._wal_status = "PREPARED"
-                    self._authenticity_status = "FAILED_WAL_INCOMPLETE"
-                    self._rollback_protection_status = "WAL_INCOMPLETE_PREPARED"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-
-                anchor_prov, anchor_min_gen, _, anchor_ok = self._anchor.read_anchor()
-                if not anchor_ok:
-                    log.critical("[FSM] ブートアンカー破損検知！ Fail-Closed により ISOLATED に固定します。")
-                    self._authenticity_status = "FAILED_ROLLBACK"
-                    self._rollback_protection_status = "CORRUPTED_ANCHOR"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-
-                min_required_gen = max(
-                    self._generation,
-                    self._max_observed_generation,
-                    journal_max_gen,
-                    anchor_min_gen if anchor_prov else 0,
-                )
-                if gen < min_required_gen:
-                    log.critical(
-                        f"[FSM] 永続状態の世代巻き戻し/古い正規ファイルの再投入(Rollback: {gen} < {min_required_gen})を検知！ "
-                        "Fail-Closed により ISOLATED に固定します。"
-                    )
-                    self._authenticity_status = "FAILED_ROLLBACK"
-                    if anchor_prov and gen < anchor_min_gen and gen >= journal_max_gen:
-                        self._rollback_protection_status = "ANCHOR_ROLLBACK_DETECTED"
-                    else:
-                        self._rollback_protection_status = "ROLLBACK_DETECTED"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-
-                if self._journal_path and gen != journal_max_gen:
-                    log.critical(
-                        f"[FSM] State世代({gen})とJournal世代({journal_max_gen})の不整合を検知！ "
-                        "Fail-Closed により ISOLATED に固定します。"
-                    )
-                    self._authenticity_status = "FAILED_JOURNAL_DESYNC"
-                    self._rollback_protection_status = "DESYNC_DETECTED"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-
-                if self._journal_path and journal_last_state is not None and state != journal_last_state:
-                    log.critical(
-                        f"[FSM] 同一世代({gen})におけるState('{state}')とJournal('{journal_last_state}')の状態不一致を検知！ "
-                        "Fail-Closed により ISOLATED に固定します。"
-                    )
-                    self._authenticity_status = "FAILED_STATE_MISMATCH"
-                    self._rollback_protection_status = "STATE_MISMATCH_DETECTED"
-                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    return
-                self._wal_status = "COMMITTED"
-
-                # Restore verified metadata
+            # Case 2: State exists & HMAC valid, but Journal file is missing (P0-004)
+            if self._journal_path and not journal_exists:
+                log.critical("[FSM] 世代ジャーナルファイルが欠損しています！ ロールバック攻撃防止のため ISOLATED に固定します。")
                 self._generation = gen
-                self._max_observed_generation = max(self._max_observed_generation, gen)
-                self._last_transition = ts
-                tokens = data.get("consumed_tokens", [])
-                if isinstance(tokens, list):
-                    self._consumed_recovery_tokens.update(str(t) for t in tokens)
-                saved_evt = data.get("active_event_id")
-                saved_chg = data.get("active_challenge_id")
-                if isinstance(saved_evt, str) and saved_evt:
-                    self._active_isolation_event_id = saved_evt
-                if isinstance(saved_chg, str) and saved_chg:
-                    self._active_challenge_id = saved_chg
+                self._max_observed_generation = gen
+                self._authenticity_status = "FAILED_MISSING_JOURNAL"
+                self._rollback_protection_status = "MISSING_JOURNAL"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
 
-                # P2-003: Normalize interrupted transient states (EMERGENCY, RECOVERY_PENDING, RECOVERY_APPROVED, ARMING) to ISOLATED
-                if self._normalize_transient_on_boot and state in self.TRANSIENT_STATES:
-                    log.critical(
-                        f"[FSM] 過渡状態 '{state}' (gen={gen}) での停止からの再起動を検知しました。"
-                        "自動ACTIVE復帰を禁止し、Fail-Closed により ISOLATED に正規化します。"
-                    )
-                    self._state = self.ISOLATED
-                    self._simulated_state = self.ISOLATED
-                    self._generation = gen + 1
-                    self._max_observed_generation = max(self._max_observed_generation, self._generation)
-                    if not self._active_isolation_event_id:
-                        self._active_isolation_event_id = f"evt-boot-{secrets.token_hex(16)}"
-                    if not self._active_challenge_id:
-                        self._active_challenge_id = f"chg-boot-{secrets.token_hex(16)}"
-                    self._save_persistent_state()
+            # Case 2b: State & Journal exist, but Boot Anchor file is missing (Section 3 Req 7 partial state detection)
+            if self._anchor_path and not anchor_file_exists:
+                log.critical("[FSM] ブートアンカーファイルが欠損しています！ 部分欠損検知により ISOLATED に固定します。")
+                self._generation = gen
+                self._max_observed_generation = gen
+                self._authenticity_status = "FAILED_MISSING_ANCHOR"
+                self._rollback_protection_status = "MISSING_ANCHOR"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
+
+            # Case 3: Cross-check State vs Journal (COMMITTED vs PREPARED) & Anchor & Key SEAL & TPM
+            journal_max_gen, journal_last_state, journal_status = self._read_journal_record()
+            if journal_status == "CORRUPTED":
+                self._authenticity_status = "FAILED_ROLLBACK"
+                self._rollback_protection_status = "CORRUPTED_JOURNAL"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
+
+            if journal_status == "PREPARED_INCOMPLETE":
+                log.critical(
+                    f"[FSM] 未完了のWALトランザクション(status=PREPARED, journal_gen={journal_max_gen}, "
+                    f"state_gen={gen})を検知！ 不完全トランザクションからのACTIVE復元を禁止し、ISOLATEDに固定します。"
+                )
+                self._generation = max(gen, journal_max_gen)
+                self._max_observed_generation = self._generation
+                self._wal_status = "PREPARED"
+                self._authenticity_status = "FAILED_WAL_INCOMPLETE"
+                self._rollback_protection_status = "WAL_INCOMPLETE_PREPARED"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
+
+            anchor_prov, anchor_min_gen, _, anchor_ok = self._anchor.read_anchor()
+            if not anchor_ok:
+                log.critical("[FSM] ブートアンカー・鍵SEAL・TPMの整合性破損検知！ Fail-Closed により ISOLATED に固定します。")
+                self._authenticity_status = (
+                    "FAILED_TPM_SECURITY"
+                    if self._anchor.tpm_backend.is_required_or_configured and not self._anchor.hardware_monotonic_protection
+                    else "FAILED_ROLLBACK"
+                )
+                self._rollback_protection_status = "CORRUPTED_ANCHOR"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
+
+            min_required_gen = max(
+                self._generation,
+                self._max_observed_generation,
+                journal_max_gen,
+                anchor_min_gen if anchor_prov else 0,
+            )
+            if gen < min_required_gen:
+                log.critical(
+                    f"[FSM] 永続状態の世代巻き戻し/古い正規ファイルの再投入(Rollback: {gen} < {min_required_gen})を検知！ "
+                    "Fail-Closed により ISOLATED に固定します。"
+                )
+                self._authenticity_status = "FAILED_ROLLBACK"
+                tpm_rollback = False
+                if self._anchor.tpm_backend.is_required_or_configured:
+                    t_ok, t_val, _ = self._anchor.tpm_backend.probe_and_read()
+                    if t_ok and t_val > gen:
+                        tpm_rollback = True
+                if tpm_rollback:
+                    self._rollback_protection_status = "TPM_ROLLBACK_DETECTED"
+                elif anchor_prov and gen < anchor_min_gen and gen >= journal_max_gen:
+                    self._rollback_protection_status = "ANCHOR_ROLLBACK_DETECTED"
+                else:
+                    self._rollback_protection_status = "ROLLBACK_DETECTED"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
+
+            if self._journal_path and gen != journal_max_gen:
+                log.critical(
+                    f"[FSM] State世代({gen})とJournal世代({journal_max_gen})の不整合を検知！ "
+                    "Fail-Closed により ISOLATED に固定します。"
+                )
+                self._authenticity_status = "FAILED_JOURNAL_DESYNC"
+                self._rollback_protection_status = "DESYNC_DETECTED"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
+
+            if self._journal_path and journal_last_state is not None and state != journal_last_state:
+                log.critical(
+                    f"[FSM] 同一世代({gen})におけるState('{state}')とJournal('{journal_last_state}')の状態不一致を検知！ "
+                    "Fail-Closed により ISOLATED に固定します。"
+                )
+                self._authenticity_status = "FAILED_STATE_MISMATCH"
+                self._rollback_protection_status = "STATE_MISMATCH_DETECTED"
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
+
+            # Section 2 Attack #11 & Section 3 Req 8: Cross-check Anchor, Key SEAL, and TPM against (gen, state)
+            layers_ok, layer_reason = self._anchor.verify_layer_consistency(gen, state)
+            if not layers_ok:
+                log.critical(
+                    f"[FSM] 鍵SEAL・Anchor・TPMとStateの不整合({layer_reason}: gen={gen}, state={state})を検知！ "
+                    "古い鍵/古いSEALの再利用を拒否し ISOLATED に固定します。"
+                )
+                if layer_reason == "TPM_ROLLBACK_DETECTED":
+                    self._authenticity_status = "FAILED_ROLLBACK"
+                elif layer_reason.startswith("TPM_"):
+                    self._authenticity_status = "FAILED_TPM_SECURITY"
+                elif layer_reason.endswith("_DESYNC_DETECTED"):
+                    self._authenticity_status = "FAILED_ANCHOR_DESYNC"
+                else:
+                    self._authenticity_status = "FAILED_ROLLBACK"
+                self._rollback_protection_status = layer_reason
+                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                return
+
+            self._wal_status = "COMMITTED"
+
+            # Restore verified metadata
+            self._generation = gen
+            self._max_observed_generation = max(self._max_observed_generation, gen)
+            self._last_transition = ts
+            with _GLOBAL_PROVISIONED_STORAGE_LOCK:
+                prev_entry = _GLOBAL_PROVISIONED_STORAGE_LEDGER.get(self._state_path)
+                high_g = max(gen, prev_entry[0] if prev_entry else 0)
+                _GLOBAL_PROVISIONED_STORAGE_LEDGER[self._state_path] = (high_g, str(state))
+            tokens = data.get("consumed_tokens", [])
+            if isinstance(tokens, list):
+                self._consumed_recovery_tokens.update(str(t) for t in tokens)
+            saved_evt = data.get("active_event_id")
+            saved_chg = data.get("active_challenge_id")
+            if isinstance(saved_evt, str) and saved_evt:
+                self._active_isolation_event_id = saved_evt
+            if isinstance(saved_chg, str) and saved_chg:
+                self._active_challenge_id = saved_chg
+
+            # P2-003: Normalize interrupted transient states (EMERGENCY, RECOVERY_PENDING, RECOVERY_APPROVED, ARMING) to ISOLATED
+            if self._normalize_transient_on_boot and state in self.TRANSIENT_STATES:
+                log.critical(
+                    f"[FSM] 過渡状態 '{state}' (gen={gen}) での停止からの再起動を検知しました。"
+                    "自動ACTIVE復帰を禁止し、Fail-Closed により ISOLATED に正規化します。"
+                )
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                self._generation = gen + 1
+                self._max_observed_generation = max(self._max_observed_generation, self._generation)
+                if not self._active_isolation_event_id:
+                    self._active_isolation_event_id = f"evt-boot-{secrets.token_hex(16)}"
+                if not self._active_challenge_id:
+                    self._active_challenge_id = f"chg-boot-{secrets.token_hex(16)}"
+                if self._save_persistent_state_locked():
                     self._authenticity_status = "VERIFIED"
                     self._rollback_protection_status = "VERIFIED_JOURNAL"
                     self._boot_integrity_status = "NORMALIZED_TRANSIENT_TO_ISOLATED"
-                    return
+                else:
+                    self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+                return
 
-                self._state = state
-                self._simulated_state = state
-                if state == self.ISOLATED:
-                    if not self._active_isolation_event_id:
-                        self._active_isolation_event_id = f"evt-restored-{secrets.token_hex(16)}"
-                    if not self._active_challenge_id:
-                        self._active_challenge_id = f"chg-restored-{secrets.token_hex(16)}"
-                self._authenticity_status = "VERIFIED"
-                self._rollback_protection_status = "VERIFIED_JOURNAL" if self._journal_path else "UNAVAILABLE"
-                self._boot_integrity_status = "VERIFIED_RESTORE"
-                log.info(f"[FSM] 永続状態を復元しました: {state} (gen={gen})")
-            except Exception as exc:
-                log.critical(f"[FSM] 永続状態読み込み失敗 ({exc})。Fail-Closed で ISOLATED に移行します。")
-                self._authenticity_status = "FAILED_LOAD"
-                self._rollback_protection_status = "LOAD_ERROR"
-                self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
-                self._state = self.ISOLATED
-                self._simulated_state = self.ISOLATED
+            self._state = state
+            self._simulated_state = state
+            if state == self.ISOLATED:
+                if not self._active_isolation_event_id:
+                    self._active_isolation_event_id = f"evt-restored-{secrets.token_hex(16)}"
+                if not self._active_challenge_id:
+                    self._active_challenge_id = f"chg-restored-{secrets.token_hex(16)}"
+            self._authenticity_status = "VERIFIED"
+            self._rollback_protection_status = "VERIFIED_JOURNAL" if self._journal_path else "UNAVAILABLE"
+            self._boot_integrity_status = "VERIFIED_RESTORE"
+            log.info(f"[FSM] 永続状態を復元しました: {state} (gen={gen})")
+        except PermissionError as exc:
+            log.critical(f"[FSM] 永続ファイルセキュリティ違反 ({exc})。Fail-Closed で ISOLATED に移行します。")
+            self._authenticity_status = "FAILED_STORAGE_SECURITY"
+            self._rollback_protection_status = "STORAGE_SECURITY_VIOLATION"
+            self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
+        except Exception as exc:
+            log.critical(f"[FSM] 永続状態読み込み失敗 ({exc})。Fail-Closed で ISOLATED に移行します。")
+            self._authenticity_status = "FAILED_LOAD"
+            self._rollback_protection_status = "LOAD_ERROR"
+            self._boot_integrity_status = "FAIL_CLOSED_ISOLATED"
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
 
     def startup_initialize(self, *, oni_mode: bool = False) -> bool:
         """Safe Fail-Closed boot sequence for production FSM (P0-001).
@@ -1614,42 +2802,61 @@ class MK1SafetyStateMachine:
             return False
 
     def get_security_status_report(self) -> dict[str, Any]:
-        with self._acquire_lock():
-            return {
-                "FSM_AUTHENTICITY": self._authenticity_status,
-                "GENERATION": self._generation,
-                "MAX_OBSERVED_GENERATION": self._max_observed_generation,
-                "ROLLBACK_PROTECTION": self._rollback_protection_status,
-                "BOOT_INTEGRITY": self._boot_integrity_status,
-                "HARDWARE_ANCHOR": self._anchor.hardware_status,
-                "RECOVERY_STATUS": self._state,
-                "SIMULATED_STATE": self._simulated_state,
-                "EMERGENCY_LATCH": self._emergency_latch,
-                "EMERGENCY_EPOCH": self._emergency_epoch,
-                "KILL_SWITCH_STATUS": self._kill_switch_status,
-                "NETWORK_BLOCK_CONFIRMED": self._network_block_confirmed,
-                "STRICT_DRY_RUN_ISOLATION": self._strict_dry_run_isolation,
-            }
+        return {
+            "FSM_AUTHENTICITY": self._authenticity_status,
+            "GENERATION": self._generation,
+            "MAX_OBSERVED_GENERATION": self._max_observed_generation,
+            "ROLLBACK_PROTECTION": self._rollback_protection_status,
+            "ROLLBACK_PROTECTION_BACKEND": (
+                "TPM2_AND_FILE_SEAL_ANCHOR"
+                if self._anchor.hardware_monotonic_protection
+                else "FILE_SEAL_AND_ANCHOR_ONLY"
+            ),
+            "SOFTWARE_ROLLBACK_PROTECTION": bool(
+                self._state_path and self._journal_path and self._anchor_path
+            ),
+            "BOOT_INTEGRITY": self._boot_integrity_status,
+            "HARDWARE_ANCHOR": self._anchor.hardware_status,
+            "TPM_STATUS": self._anchor.tpm_status,
+            "TPM2_STATUS": self._anchor.tpm_status,
+            "HARDWARE_MONOTONIC_PROTECTION": self._anchor.hardware_monotonic_protection,
+            "RECOVERY_STATUS": self._state,
+            "SIMULATED_STATE": self._simulated_state,
+            "EMERGENCY_LATCH": self._emergency_latch,
+            "EMERGENCY_EPOCH": self._emergency_epoch,
+            "KILL_SWITCH_STATUS": self._kill_switch_status,
+            "NETWORK_BLOCK_CONFIRMED": self._network_block_confirmed,
+            "CORE_ISOLATION_VERIFIED": bool(
+                self._state == self.ISOLATED
+                and self._network_block_confirmed
+                and self._kill_switch_status == self.KS_OS_BLOCK_CONFIRMED
+            ),
+            "STRICT_DRY_RUN_ISOLATION": self._strict_dry_run_isolation,
+        }
+
+    @property
+    def tpm_status(self) -> str:
+        return self._anchor.tpm_status
+
+    @property
+    def hardware_monotonic_protection(self) -> bool:
+        return self._anchor.hardware_monotonic_protection
 
     @property
     def current_state(self) -> str:
-        with self._acquire_lock():
-            return self._state
+        return self._state
 
     @property
     def simulated_state(self) -> str:
-        with self._acquire_lock():
-            return self._simulated_state
+        return self._simulated_state
 
     @property
     def generation(self) -> int:
-        with self._acquire_lock():
-            return self._generation
+        return self._generation
 
     @property
     def max_observed_generation(self) -> int:
-        with self._acquire_lock():
-            return self._max_observed_generation
+        return self._max_observed_generation
 
     @property
     def emergency_latch(self) -> bool:
@@ -1663,35 +2870,34 @@ class MK1SafetyStateMachine:
 
     @property
     def kill_switch_status(self) -> str:
-        with self._acquire_lock():
-            return self._kill_switch_status
+        return self._kill_switch_status
 
     @property
     def network_block_confirmed(self) -> bool:
-        with self._acquire_lock():
-            return bool(
-                self._network_block_confirmed
-                and self._kill_switch_status == self.KS_OS_BLOCK_CONFIRMED
-            )
+        return bool(
+            self._network_block_confirmed
+            and self._kill_switch_status == self.KS_OS_BLOCK_CONFIRMED
+        )
 
     @property
     def boot_integrity_status(self) -> str:
-        with self._acquire_lock():
-            return self._boot_integrity_status
+        return self._boot_integrity_status
 
     @property
     def last_recovery_approval(self) -> dict[str, Any] | None:
-        with self._acquire_lock():
-            return dict(self._last_recovery_approval) if self._last_recovery_approval else None
+        return dict(self._last_recovery_approval) if self._last_recovery_approval else None
 
     @property
     def last_dry_run_audit(self) -> dict[str, Any] | None:
-        with self._acquire_lock():
-            return dict(self._last_dry_run_audit) if self._last_dry_run_audit else None
+        return dict(self._last_dry_run_audit) if self._last_dry_run_audit else None
 
     @property
     def journal_path(self) -> str | None:
         return self._journal_path
+
+    @property
+    def anchor_path(self) -> str | None:
+        return self._anchor_path
 
     @property
     def state_path(self) -> str | None:
@@ -1699,16 +2905,14 @@ class MK1SafetyStateMachine:
 
     @property
     def authenticity_status(self) -> str:
-        with self._acquire_lock():
-            return self._authenticity_status
+        return self._authenticity_status
 
     @property
     def rollback_protection_status(self) -> str:
-        with self._acquire_lock():
-            return self._rollback_protection_status
+        return self._rollback_protection_status
 
     def record_kill_switch_state(self, status: str, *, confirmed: bool = False) -> None:
-        """Update independent Kill Switch OS containment status (P0-005)."""
+        """Update independent Kill Switch OS containment status (P0-005, I-02, I-03, I-19)."""
         if status not in self.VALID_KILL_SWITCH_STATES:
             raise ValueError(f"Invalid kill_switch_status: {status}")
         with self._acquire_lock():
@@ -1747,7 +2951,7 @@ class MK1SafetyStateMachine:
 
         self._sync_from_disk_if_newer_locked()
         if self._state != self.ISOLATED:
-            if self._state != self.EMERGENCY:
+            if self._state != self.EMERGENCY and self.EMERGENCY in self._allowed_transitions.get(self._state, set()):
                 self._transition_to_locked(self.EMERGENCY, reason=latest_reason, simulated=False)
             self._transition_to_locked(self.ISOLATED, reason=latest_reason, simulated=False)
         if self._kill_switch_status == self.KS_NOT_REQUESTED:
@@ -1760,7 +2964,7 @@ class MK1SafetyStateMachine:
             raise RuntimeError(f"Invalid unknown FSM state: {new_state}")
 
         if simulated:
-            # P0-002: Strict Dry-Run Isolation is unconditionally enforced.
+            # P0-002 / I-14: Strict Dry-Run Isolation is unconditionally enforced.
             # Production _state, _generation, persistent files, and tokens are NEVER modified.
             base_state = self._simulated_state
             if base_state == new_state:
@@ -1788,6 +2992,9 @@ class MK1SafetyStateMachine:
             self._record_audit("DRY_RUN_TRANSITION", base_state, new_state, reason, simulated=True)
             return True
 
+        if self._dry_run_only:
+            raise RuntimeError("Production state transition is prohibited on Dry-Run FSM instance (Section 3 / I-14)")
+
         self._sync_from_disk_if_newer_locked()
 
         if self._state == new_state:
@@ -1802,6 +3009,7 @@ class MK1SafetyStateMachine:
         prev_gen = self._generation
         prev_max_gen = self._max_observed_generation
         prev_ts = self._last_transition
+        prev_auth = self._authenticity_status
         log.warning(f"[FSM] 状態遷移: {prev_state} -> {new_state} (理由: {reason}, simulated=False)")
         self._state = new_state
         self._simulated_state = new_state
@@ -1815,8 +3023,8 @@ class MK1SafetyStateMachine:
             if not self._active_challenge_id:
                 self._active_challenge_id = f"chg-{secrets.token_hex(16)}"
 
-        if not self._save_persistent_state():
-            # P1-002: If persistence fails during emergency/isolation, stay Fail-Closed in ISOLATED in memory
+        if not self._save_persistent_state_locked():
+            # P1-002 / I-09: If persistence fails during emergency/isolation, stay Fail-Closed in ISOLATED in memory
             # and clearly mark authenticity as FAILED_PERSISTENCE.
             if new_state in (self.EMERGENCY, self.ISOLATED):
                 self._authenticity_status = "FAILED_PERSISTENCE"
@@ -1826,6 +3034,8 @@ class MK1SafetyStateMachine:
             self._generation = prev_gen
             self._max_observed_generation = prev_max_gen
             self._last_transition = prev_ts
+            if self._wal_status == "COMMITTED":
+                self._authenticity_status = prev_auth
             raise RuntimeError(f"FSM state persistence failed during transition {prev_state} -> {new_state}")
 
         if new_state == self.EMERGENCY:
@@ -1868,7 +3078,7 @@ class MK1SafetyStateMachine:
         challenge_id: str | None = None,
         simulated: bool = False,
     ) -> bool:
-        """Preempts any active or pending recovery state and locks the FSM into ISOLATED (P0-003, P3-001)."""
+        """Preempts any active or pending recovery state and locks the FSM into ISOLATED without blocking on persistence locks (Section 4, P0-003, I-01, I-10)."""
         if simulated:
             with self._acquire_lock():
                 target_cur = self._simulated_state
@@ -1879,7 +3089,7 @@ class MK1SafetyStateMachine:
                 return self._simulated_state == self.ISOLATED
 
         # Step 1 (Lock-Free Atomic Preemption Latch): Immediately latch P0 emergency and increment epoch
-        # before waiting on _lock, so any concurrent recovery is guaranteed to see the preemption and abort.
+        # before touching _lock, so P0 emergency isolation NEVER depends on persistence lock wait!
         with self._emergency_preempt_lock:
             self._emergency_latch = True
             self._emergency_epoch += 1
@@ -1892,14 +3102,36 @@ class MK1SafetyStateMachine:
             })
         _ONI_MODE_ACTIVE.set()
 
-        # Step 2: Acquire state lock and drain emergency queue into EMERGENCY -> ISOLATED
+        # Step 2: Attempt to acquire state lock to persist EMERGENCY -> ISOLATED.
+        # Even if persistence lock times out or fails (e.g., lock contention or broken lock file),
+        # force in-memory Fail-Closed ISOLATED immediately so P0 safety is never delayed or lost!
         try:
-            with self._acquire_lock(timeout=max(self._lock_timeout_sec, 5.0)):
+            with self._acquire_lock(timeout=self._lock_timeout_sec):
                 self._drain_pending_emergency_locked()
                 return self._state == self.ISOLATED
-        except TimeoutError:
-            log.critical("[FSM] 緊急隔離ロック待機タイムアウト。緊急ラッチにより進行中トランザクションを強制中断します。")
-            return False
+        except (TimeoutError, FSMLockError, OSError) as exc:
+            log.critical(f"[FSM] 緊急隔離時の永続化ロック取得失敗 ({exc})。ロック待ちに依存せずインメモリでISOLATEDへ即時固定します。")
+            with self._emergency_preempt_lock:
+                prev_st = self._state
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
+                self._generation += 1
+                self._max_observed_generation = max(self._max_observed_generation, self._generation)
+                if event_id is not None:
+                    self._active_isolation_event_id = event_id
+                elif not self._active_isolation_event_id:
+                    self._active_isolation_event_id = f"evt-{secrets.token_hex(16)}"
+                if challenge_id is not None:
+                    self._active_challenge_id = challenge_id
+                elif not self._active_challenge_id:
+                    self._active_challenge_id = f"chg-{secrets.token_hex(16)}"
+                self._authenticity_status = "FAILED_PERSISTENCE"
+                self._rollback_protection_status = "LOCK_FAILED"
+                if self._kill_switch_status == self.KS_NOT_REQUESTED:
+                    self._kill_switch_status = self.KS_LOGICALLY_ISOLATED
+                    self._network_block_confirmed = False
+                self._record_audit("EMERGENCY_FORCED_WITHOUT_LOCK", prev_st, self.ISOLATED, f"{reason} (lock error: {exc})")
+            return True
 
     def _verify_recovery_preconditions_locked(
         self,
@@ -1911,7 +3143,7 @@ class MK1SafetyStateMachine:
         req_challenge_id: str,
         auth_verified: bool,
     ) -> bool:
-        """Re-verify all 7 mandatory invariants before each recovery commit stage (P0-003)."""
+        """Re-verify all mandatory invariants before each recovery commit stage (P0-003, I-01, I-04, I-05, I-06, I-10)."""
         with self._emergency_preempt_lock:
             latch_active = self._emergency_latch or bool(self._pending_emergency_events)
             current_epoch = self._emergency_epoch
@@ -1925,6 +3157,8 @@ class MK1SafetyStateMachine:
             or self._active_challenge_id != req_challenge_id
             or not auth_verified
             or self._recovery_approval_status != "VERIFIED"
+            or self._wal_status == "PREPARED"
+            or self._authenticity_status.startswith("FAILED_")
         ):
             log.critical(
                 f"[FSM] Recovery コミット前再検証失敗 (latch={latch_active}, epoch={current_epoch}/{snap_epoch}, "
@@ -1935,7 +3169,7 @@ class MK1SafetyStateMachine:
             if self._state != self.ISOLATED:
                 self._state = self.ISOLATED
                 self._simulated_state = self.ISOLATED
-                self._save_persistent_state()
+                self._save_persistent_state_locked()
             return False
         return True
 
@@ -1950,7 +3184,7 @@ class MK1SafetyStateMachine:
         expected_policy_version: int = 1,
         now: int | None = None,
     ) -> bool:
-        """Mandatory M-of-N human gate for recovering from ISOLATED state (P0-003, P1-005, P1-006, P2-001)."""
+        """Mandatory M-of-N human gate for recovering from ISOLATED state (P0-003, P1-005, P1-006, P2-001, Section 4)."""
         from mk1_quorum import (
             verify_quorum_bundle,
             _validate_identifier_token,
@@ -1962,28 +3196,35 @@ class MK1SafetyStateMachine:
         # =====================================================================
         # PHASE R1: Short lock acquisition for precondition check & RECOVERY_PENDING
         # =====================================================================
-        with self._acquire_lock():
-            if self._emergency_latch or self._pending_emergency_events:
-                self._drain_pending_emergency_locked()
-                return False
-            self._sync_from_disk_if_newer_locked()
-            if self._state != self.ISOLATED:
-                log.error(f"[FSM] 復旧拒否: 現在の状態 {self._state} からは復旧できません。")
-                return False
+        try:
+            with self._acquire_lock():
+                if self._emergency_latch or self._pending_emergency_events:
+                    self._drain_pending_emergency_locked()
+                    return False
+                self._sync_from_disk_if_newer_locked()
+                if self._state != self.ISOLATED or self._authenticity_status.startswith("FAILED_") or self._wal_status == "PREPARED":
+                    log.error(f"[FSM] 復旧拒否: 現在の状態 {self._state} (auth={self._authenticity_status}, wal={self._wal_status}) からは復旧できません。")
+                    return False
 
-            snap_epoch = self.emergency_epoch
-            req_event_id = expected_event_id if expected_event_id is not None else self._active_isolation_event_id
-            req_challenge_id = expected_challenge_id if expected_challenge_id is not None else self._active_challenge_id
-            try:
-                self._recovery_approval_status = "PENDING"
-                self._transition_to_locked(self.RECOVERY_PENDING, reason="Recovery Requested")
-                pending_gen = self._generation
-            except Exception as exc:
-                log.error(f"[FSM] RECOVERY_PENDING 遷移失敗: {exc}")
-                self._recovery_approval_status = "REJECTED"
-                self._state = self.ISOLATED
-                self._simulated_state = self.ISOLATED
-                return False
+                snap_epoch = self.emergency_epoch
+                req_event_id = expected_event_id if expected_event_id is not None else self._active_isolation_event_id
+                req_challenge_id = expected_challenge_id if expected_challenge_id is not None else self._active_challenge_id
+                try:
+                    self._recovery_approval_status = "PENDING"
+                    self._transition_to_locked(self.RECOVERY_PENDING, reason="Recovery Requested")
+                    pending_gen = self._generation
+                except Exception as exc:
+                    log.error(f"[FSM] RECOVERY_PENDING 遷移失敗: {exc}")
+                    self._recovery_approval_status = "REJECTED"
+                    self._state = self.ISOLATED
+                    self._simulated_state = self.ISOLATED
+                    return False
+        except (FSMLockError, TimeoutError) as lock_exc:
+            log.error(f"[FSM] 復旧Phase R1ロック取得失敗（永続化を伴うRecoveryを拒否）: {lock_exc}")
+            self._recovery_approval_status = "REJECTED"
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
+            raise
 
         # =====================================================================
         # PHASE R2: Lock-Free Cryptographic & Policy Validation (outside _lock!)
@@ -2074,147 +3315,194 @@ class MK1SafetyStateMachine:
                 raise ValueError("Quorum verification did not return at least 2 distinct verified signers")
         except Exception as exc:
             log.error(f"[FSM] 復旧検証エラー: {exc}")
-            with self._acquire_lock():
-                self._recovery_approval_status = "REJECTED"
-                self._drain_pending_emergency_locked()
-                if self._state != self.ISOLATED:
-                    try:
-                        self._transition_to_locked(self.ISOLATED, reason=f"Recovery Rejected: {exc}")
-                    except Exception:
-                        self._state = self.ISOLATED
-                        self._simulated_state = self.ISOLATED
-                        self._save_persistent_state()
+            try:
+                with self._acquire_lock():
+                    self._recovery_approval_status = "REJECTED"
+                    self._drain_pending_emergency_locked()
+                    if self._state != self.ISOLATED:
+                        try:
+                            self._transition_to_locked(self.ISOLATED, reason=f"Recovery Rejected: {exc}")
+                        except Exception:
+                            self._state = self.ISOLATED
+                            self._simulated_state = self.ISOLATED
+                            self._save_persistent_state_locked()
+            except (FSMLockError, TimeoutError):
+                self._state = self.ISOLATED
+                self._simulated_state = self.ISOLATED
             return False
 
         # =====================================================================
         # PHASE R3: Re-acquire lock, re-verify preemption & invariants, reserve tokens,
         # and commit RECOVERY_APPROVED -> ARMING -> ACTIVE transactionally.
         # =====================================================================
-        with self._acquire_lock():
-            try:
-                self._recovery_approval_status = "VERIFIED"
-                if not self._verify_recovery_preconditions_locked(
-                    snap_epoch=snap_epoch,
-                    expected_gen=pending_gen,
-                    expected_state=self.RECOVERY_PENDING,
-                    req_event_id=req_event_id,
-                    req_challenge_id=req_challenge_id,
-                    auth_verified=True,
-                ):
-                    return False
-
-                # Check replay against both consumed and currently reserved tokens (P1-006)
-                if (
-                    candidate_tokens & self._consumed_recovery_tokens
-                    or candidate_tokens & self._reserved_recovery_tokens
-                ):
-                    raise ValueError("Replay or concurrent reuse of recovery approval token rejected")
-
-                reserved_keys = set(candidate_tokens)
-                self._reserved_recovery_tokens.update(reserved_keys)
-
-                # Stage 1: RECOVERY_PENDING -> RECOVERY_APPROVED
-                self._transition_to_locked(self.RECOVERY_APPROVED, reason="M-of-N Met")
-                approved_gen = self._generation
-
-                if not self._verify_recovery_preconditions_locked(
-                    snap_epoch=snap_epoch,
-                    expected_gen=approved_gen,
-                    expected_state=self.RECOVERY_APPROVED,
-                    req_event_id=req_event_id,
-                    req_challenge_id=req_challenge_id,
-                    auth_verified=True,
-                ):
-                    self._reserved_recovery_tokens.difference_update(reserved_keys)
-                    return False
-
-                # Stage 2: RECOVERY_APPROVED -> ARMING
-                self._transition_to_locked(self.ARMING, reason="System Re-Arming After Recovery")
-                arming_gen = self._generation
-
-                if not self._verify_recovery_preconditions_locked(
-                    snap_epoch=snap_epoch,
-                    expected_gen=arming_gen,
-                    expected_state=self.ARMING,
-                    req_event_id=req_event_id,
-                    req_challenge_id=req_challenge_id,
-                    auth_verified=True,
-                ):
-                    self._reserved_recovery_tokens.difference_update(reserved_keys)
-                    return False
-
-                # Stage 3: Finalize consumed tokens and commit ARMING -> ACTIVE
-                newly_consumed = reserved_keys - self._consumed_recovery_tokens
-                self._consumed_recovery_tokens.update(newly_consumed)
+        try:
+            with self._acquire_lock():
                 try:
-                    self._transition_to_locked(self.ACTIVE, reason="Restoration Complete")
-                except Exception:
-                    # Rollback token consumption if final persistence fails (P1-006)
-                    self._consumed_recovery_tokens.difference_update(newly_consumed)
-                    raise
+                    self._recovery_approval_status = "VERIFIED"
+                    if not self._verify_recovery_preconditions_locked(
+                        snap_epoch=snap_epoch,
+                        expected_gen=pending_gen,
+                        expected_state=self.RECOVERY_PENDING,
+                        req_event_id=req_event_id,
+                        req_challenge_id=req_challenge_id,
+                        auth_verified=True,
+                    ):
+                        return False
 
-                self._reserved_recovery_tokens.difference_update(reserved_keys)
-                self._last_recovery_approval = {
-                    "verified": True,
-                    "signature_verification": "VERIFIED",
-                    "operation": "RELEASE_QUARANTINE",
-                    "signers": signers,
-                    "challenge_id": doc_challenge_id,
-                    "event_id": doc_event_id,
-                    "issued_at": issued_at,
-                    "expires_at": expires_at,
-                    "policy_version": policy_version,
-                    "generation": self._generation,
-                    "approved_at": current_ts,
-                }
-                self._active_isolation_event_id = None
-                self._active_challenge_id = None
-                self._kill_switch_status = self.KS_NOT_REQUESTED
-                self._network_block_confirmed = False
-                log.warning("[FSM] システムが正常状態（ACTIVE）に復旧しました。")
-                return True
-            except Exception as exc:
-                log.error(f"[FSM] 復旧コミット処理エラー: {exc}")
-                self._reserved_recovery_tokens.difference_update(reserved_keys)
-                self._recovery_approval_status = "REJECTED"
-                self._state = self.ISOLATED
-                self._simulated_state = self.ISOLATED
-                self._save_persistent_state()
-                return False
+                    # Check replay against both consumed and currently reserved tokens (P1-006)
+                    if (
+                        candidate_tokens & self._consumed_recovery_tokens
+                        or candidate_tokens & self._reserved_recovery_tokens
+                    ):
+                        raise ValueError("Replay or concurrent reuse of recovery approval token rejected")
+
+                    reserved_keys = set(candidate_tokens)
+                    self._reserved_recovery_tokens.update(reserved_keys)
+
+                    # Stage 1: RECOVERY_PENDING -> RECOVERY_APPROVED
+                    self._transition_to_locked(self.RECOVERY_APPROVED, reason="M-of-N Met")
+                    approved_gen = self._generation
+
+                    if not self._verify_recovery_preconditions_locked(
+                        snap_epoch=snap_epoch,
+                        expected_gen=approved_gen,
+                        expected_state=self.RECOVERY_APPROVED,
+                        req_event_id=req_event_id,
+                        req_challenge_id=req_challenge_id,
+                        auth_verified=True,
+                    ):
+                        self._reserved_recovery_tokens.difference_update(reserved_keys)
+                        return False
+
+                    # Stage 2: RECOVERY_APPROVED -> ARMING
+                    self._transition_to_locked(self.ARMING, reason="System Re-Arming After Recovery")
+                    arming_gen = self._generation
+
+                    if not self._verify_recovery_preconditions_locked(
+                        snap_epoch=snap_epoch,
+                        expected_gen=arming_gen,
+                        expected_state=self.ARMING,
+                        req_event_id=req_event_id,
+                        req_challenge_id=req_challenge_id,
+                        auth_verified=True,
+                    ):
+                        self._reserved_recovery_tokens.difference_update(reserved_keys)
+                        return False
+
+                    # Stage 3: Finalize consumed tokens and commit ARMING -> ACTIVE
+                    newly_consumed = reserved_keys - self._consumed_recovery_tokens
+                    self._consumed_recovery_tokens.update(newly_consumed)
+                    try:
+                        self._transition_to_locked(self.ACTIVE, reason="Restoration Complete")
+                    except Exception:
+                        # Rollback token consumption if final persistence fails (P1-006 / I-12)
+                        self._consumed_recovery_tokens.difference_update(newly_consumed)
+                        raise
+
+                    self._reserved_recovery_tokens.difference_update(reserved_keys)
+                    self._last_recovery_approval = {
+                        "verified": True,
+                        "signature_verification": "VERIFIED",
+                        "operation": "RELEASE_QUARANTINE",
+                        "signers": signers,
+                        "challenge_id": doc_challenge_id,
+                        "event_id": doc_event_id,
+                        "issued_at": issued_at,
+                        "expires_at": expires_at,
+                        "policy_version": policy_version,
+                        "generation": self._generation,
+                        "approved_at": current_ts,
+                    }
+                    self._active_isolation_event_id = None
+                    self._active_challenge_id = None
+                    self._kill_switch_status = self.KS_NOT_REQUESTED
+                    self._network_block_confirmed = False
+                    log.warning("[FSM] システムが正常状態（ACTIVE）に復旧しました。")
+                    return True
+                except Exception as exc:
+                    log.error(f"[FSM] 復旧コミット処理エラー: {exc}")
+                    self._reserved_recovery_tokens.difference_update(reserved_keys)
+                    self._recovery_approval_status = "REJECTED"
+                    self._state = self.ISOLATED
+                    self._simulated_state = self.ISOLATED
+                    self._save_persistent_state_locked()
+                    return False
+        except (FSMLockError, TimeoutError) as lock_exc:
+            log.error(f"[FSM] 復旧Phase R3ロック取得失敗: {lock_exc}")
+            self._recovery_approval_status = "REJECTED"
+            self._state = self.ISOLATED
+            self._simulated_state = self.ISOLATED
+            raise
 
 
-def _get_default_production_fsm_paths() -> tuple[str, str, str, str]:
-    """Return explicit (state_path, journal_path, anchor_path, key_path) for production _SAFETY_FSM (P0-001)."""
+def _get_default_production_fsm_paths(*, require_explicit_dir: bool = False) -> dict[str, str]:
+    """Return explicit persistent paths dict for production _SAFETY_FSM (Section 3, P0-001).
+
+    Never uses tempfile.gettempdir() as default storage, and never pre-creates directories before
+    MK1SafetyStateMachine inspects provisioning state.
+    """
     uid_tag = os.geteuid() if hasattr(os, "geteuid") else 0
-    base_dir = os.environ.get(
-        "MK1_FSM_STATE_DIR",
-        os.path.join(tempfile.gettempdir(), f"mk1ai_sovereign_fsm_v32_uid_{uid_tag}"),
-    )
+    env_dir = os.environ.get("MK1_FSM_STATE_DIR")
+    if require_explicit_dir and not env_dir:
+        raise RuntimeError("Production FSM requires explicit MK1_FSM_STATE_DIR persistent storage directory (Section 3 Req 3)")
+
+    if env_dir:
+        base_dir = os.path.abspath(env_dir)
+    else:
+        home_dir = os.path.abspath(os.path.expanduser("~"))
+        tmp_root = os.path.abspath(tempfile.gettempdir())
+        if home_dir == tmp_root or home_dir.startswith(tmp_root + os.sep):
+            base_dir = os.path.abspath(f"/var/tmp/mk1ai_sovereign_fsm_v32_uid_{uid_tag}")
+        else:
+            base_dir = os.path.join(home_dir, ".local", "state", f"mk1ai_sovereign_fsm_v32_uid_{uid_tag}")
+
     state_dir = os.path.join(base_dir, "state")
     journal_dir = os.path.join(base_dir, "journal")
+    anchor_dir = os.path.join(base_dir, "anchor")
     key_dir = os.path.join(base_dir, "keys")
-    for d in (state_dir, journal_dir, key_dir):
-        os.makedirs(d, exist_ok=True)
-        try:
-            os.chmod(d, 0o700)
-        except OSError:
-            pass
     state_path = os.environ.get("MK1_FSM_STATE_PATH", os.path.join(state_dir, "fsm_state.json"))
     journal_path = os.environ.get("MK1_FSM_JOURNAL_PATH", os.path.join(journal_dir, "fsm_state.gen_journal"))
-    anchor_path = os.environ.get("MK1_FSM_ANCHOR_PATH", os.path.join(journal_dir, "fsm_state.boot_anchor"))
+    anchor_path = os.environ.get("MK1_FSM_ANCHOR_PATH", os.path.join(anchor_dir, "fsm_state.boot_anchor"))
     key_path = os.environ.get("MK1_FSM_KEY_PATH", os.path.join(key_dir, "fsm_hmac.key"))
-    return state_path, journal_path, anchor_path, key_path
+    return {
+        "state_path": state_path,
+        "journal_path": journal_path,
+        "anchor_path": anchor_path,
+        "key_path": key_path,
+    }
 
 
-def _init_production_safety_fsm() -> MK1SafetyStateMachine:
-    """Initialize and verify the production global _SAFETY_FSM with fail-closed persistence (P0-001)."""
-    s_path, j_path, a_path, k_path = _get_default_production_fsm_paths()
+def _init_production_safety_fsm(
+    *,
+    require_explicit_dir: bool = False,
+    require_existing_state: bool | None = None,
+) -> MK1SafetyStateMachine:
+    """Initialize and verify the production global _SAFETY_FSM with fail-closed persistence (Section 3, P0-001)."""
+    paths = _get_default_production_fsm_paths(require_explicit_dir=require_explicit_dir)
+    s_path = paths["state_path"]
+    j_path = paths["journal_path"]
+    a_path = paths["anchor_path"]
+    k_path = paths["key_path"]
+    with _PRODUCTION_FSM_PATHS_LOCK:
+        _PRODUCTION_FSM_PATHS_REGISTRY.update({
+            os.path.abspath(s_path),
+            os.path.abspath(j_path),
+            os.path.abspath(a_path),
+            os.path.abspath(k_path),
+        })
+    strict_existing = (
+        require_existing_state
+        if require_existing_state is not None
+        else (str(os.environ.get("MK1_REQUIRE_EXISTING_STATE", "")).lower() in {"1", "true", "yes", "on"})
+    )
     fsm = MK1SafetyStateMachine(
         state_path=s_path,
         journal_path=j_path,
         anchor_path=a_path,
         key_path=k_path,
         strict_dry_run_isolation=True,
+        require_existing_state=strict_existing,
+        allow_initial_provisioning=(not strict_existing),
     )
     oni_requested = str(os.environ.get("ONI_MODE", "")).lower() in {"1", "true", "yes", "on"}
     fsm.startup_initialize(oni_mode=oni_requested)
@@ -2222,6 +3510,8 @@ def _init_production_safety_fsm() -> MK1SafetyStateMachine:
 
 
 _SAFETY_FSM = _init_production_safety_fsm()
+_MATH_ENGINE = MK1MathematicalSecurityEngine(policy_version=1)
+_SAFETY_SUPERVISOR = MK1SafetySupervisor(_SAFETY_FSM, _MATH_ENGINE)
 
 
 def ONI_MODE_is_active() -> bool:
@@ -4709,7 +5999,8 @@ def _apply_nft_policy_with_sudo(
     return True
 
 
-def _persist_quarantine_state() -> bool:
+def _persist_quarantine_state(*args, **kwargs) -> bool:
+
     try:
         QuarantineStateStore().mark_quarantined()
     except (OSError, QuarantineError) as exc:
@@ -5566,7 +6857,7 @@ def _self_protection_monitor() -> None:
             if initial_path and current_path:
                 if current_path != initial_path:
                     log.warning("[SELF_PROTECTION] 実行ファイルが変更されました。即時遮断を発動します。")
-                    evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True)
+                    evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True, autonomous=True)
                     break
 
             # ハッシュ比較: 初期ハッシュと現在ハッシュが共に取得できている場合のみ比較
@@ -5582,7 +6873,7 @@ def _self_protection_monitor() -> None:
             if initial_hash and current_hash:
                 if current_hash != initial_hash:
                     log.warning("[SELF_PROTECTION] 実行ファイルの整合性が失いました。即時遮断を発動します。")
-                    evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True)
+                    evaluate_threat_state(None, False, score_a=0.99, backdoor_detected=True, autonomous=True)
                     break
 
             # /proc/self/status のチェックはコンテナ環境で誤検知を起こすため削除
@@ -7560,9 +8851,12 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
                           challenge_document: dict | None = None,
                           trusted_keys: dict[str, bytes] | None = None,
                           autonomous: bool = False,
-                          fsm: MK1SafetyStateMachine | None = None) -> bool:
+                          fsm: MK1SafetyStateMachine | None = None,
+                          packet_bytes: bytes | None = None,
+                          feature_vector: list[float] | tuple[float, ...] | None = None) -> bool:
     """Threats are advisory; active isolation requires verified per-event operator approval, 
-    unless 'autonomous=True' and high-confidence P0 threat is detected in any of the 3 heads.
+    unless 'autonomous=True' and high-confidence P0 threat is detected in any of the 3 heads,
+    validated by the Independent Mathematical Security Engine (IMSE).
     """
     global _ISOLATION_APPROVAL_PENDING, _LAST_KILL_SWITCH_TRIGGER
     global _anomaly_counter, _simulated_anomaly_counter, _LAST_THREAT_SCORE
@@ -7591,6 +8885,15 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
     if not effective_dry_run:
         _LAST_THREAT_SCORE = max(0.0, min(0.99, safe_score_a))
 
+    # Build AI report for Supervisor
+    ai_report = {
+        "threat_score": safe_score_a,
+        "confidence": 0.9, # Heuristic for now
+        "head_scores": {"head_a": safe_score_a, "head_b": safe_score_b, "head_c": safe_score_c},
+        "inference_status": "corrupted" if corrupted_scores else "success",
+        "backdoor_detected": backdoor_detected,
+    }
+
     if is_learning_mode() and (backdoor_detected or backdoor_boost > 0.0 or safe_score_a >= 0.95 or safe_score_b >= 0.95):
         _report_learning_detection(f"脅威スコア (A: {safe_score_a:.3f}, B: {safe_score_b:.3f}) を検出")
         return False
@@ -7606,141 +8909,69 @@ def evaluate_threat_state(interface: str | None, dry_run: bool, score_a: float =
         if backdoor_detected or corrupted_scores:
             effective_score_a = max(effective_score_a, 0.99)
 
-        # Anomaly counter decay logic (Head A driven; never pollute production _anomaly_counter in dry_run)
-        if not effective_dry_run:
-            last_decay_at, decayed = _apply_anomaly_decay(now, simulated=False)
-            if effective_score_a >= 0.95:
-                if _anomaly_counter > 0 and not decayed and now - last_decay_at < _ANOMALY_DECAY_WINDOW_SEC:
-                    _anomaly_counter += 1
+        # Autonomous Path (Hybrid AI + Math Engine)
+        if autonomous:
+            # Delegate to Supervisor for final decision
+            is_blocked = _SAFETY_SUPERVISOR.evaluate_hybrid_threat(
+                ai_report, 
+                packet_bytes or b"", 
+                feature_vector or ([0.0] * 10),
+                autonomous=(not effective_dry_run)
+            )
+            if is_blocked:
+                if not effective_dry_run:
+                    _KILL_SWITCH_EVENT.set()
+                    _LAST_KILL_SWITCH_TRIGGER = now
                 else:
-                    _anomaly_counter = 1
-            else:
-                _anomaly_counter = max(0, _anomaly_counter - 1)
-            active_anomaly_count = _anomaly_counter
-        else:
-            sim_last_decay_at, sim_decayed = _apply_anomaly_decay(now, simulated=True)
-            sim_cnt = globals().get("_simulated_anomaly_counter", 0)
-            if effective_score_a >= 0.95:
-                if sim_cnt > 0 and not sim_decayed and now - sim_last_decay_at < _ANOMALY_DECAY_WINDOW_SEC:
-                    sim_cnt += 1
-                else:
-                    sim_cnt = 1
-            else:
-                sim_cnt = max(0, sim_cnt - 1)
-            _simulated_anomaly_counter = sim_cnt
-            active_anomaly_count = sim_cnt
-
-        # Autonomous isolation trigger: P0 threat detection in ANY head (independent, no majority required)
-        is_p0_a = backdoor_detected or corrupted_scores or active_anomaly_count >= 3 or effective_score_a >= 0.99
-        is_p0_b = safe_score_b >= 0.98
-        is_p0_c = safe_score_c >= 0.95
-        
-        should_trigger = is_p0_a or is_p0_b or is_p0_c
-        
-        if should_trigger:
-            trigger_reasons = []
-            if corrupted_scores:
-                trigger_reasons.append("Corrupted/Non-Finite AI Score (Fail-Closed)")
-            if is_p0_a:
-                trigger_reasons.append(f"Head A (Current/Backdoor: {effective_score_a:.3f})")
-            if is_p0_b:
-                trigger_reasons.append(f"Head B (Predictive: {safe_score_b:.3f})")
-            if is_p0_c:
-                trigger_reasons.append(f"Head C (Memory Integrity: {safe_score_c:.3f})")
-
-            management_route = _configured_management_route()
-
-            if effective_dry_run:
-                log.warning("[MAINTENANCE] 脅威検知しましたが、メンテナンス状態またはDry-Runのため実遮断は行いません。")
-                log.info(
-                    "脅威イベントを検出しました。Dry-Runのため実遮断は行いません "
-                    "(reasons: %s)", ", ".join(trigger_reasons)
-                )
-                if autonomous:
-                    target_fsm.isolate_immediately(
-                        reason="Autonomous P0 Detection (Simulated)",
-                        simulated=True,
-                    )
-                else:
-                    log.warning("[ISOLATION] 脅威を検知(Dry-Run)。本来であれば管理者承認待ちとなります。")
-                if not _dispatch_privileged_command(
-                    "kill_switch", interface=interface, dry_run=True, **management_route,
-                ):
-                    execute_kill_switch(interface, True, **management_route)
+                    target_fsm.isolate_immediately(reason=f"Autonomous Hybrid Detection (Simulated): {ai_report.get('reason', 'P0')}", simulated=True)
                 return True
 
+
+        # Dry-Run / Advisory logic
+        if effective_dry_run:
+            if safe_score_a >= 0.99 or corrupted_scores:
+                log.warning("[MAINTENANCE] 脅威検知(AI)しましたが、メンテナンス状態またはDry-Runのため実遮断は行いません。")
+                if autonomous:
+                    target_fsm.isolate_immediately(reason="Autonomous P0 Detection (Simulated)", simulated=True)
+                return True
+            return False
+
+        # Standard Quorum Path
+        if verify_event_isolation_approval(
+            approval_bundle,
+            challenge_document=challenge_document,
+            trusted_keys=trusted_keys,
+            interface=interface,
+        ):
+            _ISOLATION_APPROVAL_PENDING = False
             _KILL_SWITCH_EVENT.set()
             _LAST_KILL_SWITCH_TRIGGER = now
-
-            # Autonomous Path: Bypass M-of-N if autonomous=True and confidence is P0 high (P0-005)
-            if autonomous:
-                log.warning(f"[AUTONOMOUS_DEFENSE] P0脅威を検出し、自律隔離を開始します。理由: {', '.join(trigger_reasons)}")
-                target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_REQUESTED, confirmed=False)
-                target_fsm.isolate_immediately(reason="Autonomous P0 Detection")
-                target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_LOGICALLY_ISOLATED, confirmed=False)
-                target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_PENDING, confirmed=False)
-
-                success = bool(execute_kill_switch(
-                    interface,
-                    False,
-                    autonomous_bypass=True,
-                    **management_route,
-                ))
-                if not success:
-                    target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_FAILED, confirmed=False)
-                    log.critical(
-                        "[AUTONOMOUS_DEFENSE] 論理FSMはISOLATEDに移行しましたが、OSレベルのKill Switch遮断に失敗しました(OS_BLOCK_FAILED)。"
-                    )
-                    return False
-
-                if callable(getattr(target_fsm, "_network_block_verifier", None)):
-                    try:
-                        v_res = target_fsm._network_block_verifier(interface)
-                    except Exception as exc:
-                        log.error(f"[AUTONOMOUS_DEFENSE] ネットワーク遮断検証中に例外が発生しました ({exc})")
-                        v_res = False
-                    if v_res == "PARTIAL":
-                        target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_PARTIALLY_ISOLATED, confirmed=False)
-                        return False
-                    if not v_res:
-                        target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_VERIFICATION_FAILED, confirmed=False)
-                        return False
-
-                target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_CONFIRMED, confirmed=True)
-                return True
-
-            # Standard Quorum Path
-            if verify_event_isolation_approval(
-                approval_bundle,
+            target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_REQUESTED, confirmed=False)
+            target_fsm.transition_to(MK1SafetyStateMachine.EMERGENCY, reason="Quorum Approval Received")
+            target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_PENDING, confirmed=False)
+            
+            management_route = _configured_management_route()
+            success = bool(execute_kill_switch(
+                interface,
+                False,
+                approval_bundle=approval_bundle,
                 challenge_document=challenge_document,
                 trusted_keys=trusted_keys,
-                interface=interface,
-            ):
-                _ISOLATION_APPROVAL_PENDING = False
-                target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_REQUESTED, confirmed=False)
-                target_fsm.transition_to(MK1SafetyStateMachine.EMERGENCY, reason="Quorum Approval Received")
-                target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_PENDING, confirmed=False)
-                success = bool(execute_kill_switch(
-                    interface,
-                    False,
-                    approval_bundle=approval_bundle,
-                    challenge_document=challenge_document,
-                    trusted_keys=trusted_keys,
-                    **management_route,
-                ))
-                if success:
-                    target_fsm.transition_to(MK1SafetyStateMachine.ISOLATED, reason="Isolation Complete")
-                    target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_CONFIRMED, confirmed=True)
-                else:
-                    target_fsm.isolate_immediately(reason="Quorum Kill Switch OS Block Failed (Fail-Closed Logical Isolation)")
-                    target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_FAILED, confirmed=False)
-                return success
+                **management_route,
+            ))
+            if success:
+                target_fsm.transition_to(MK1SafetyStateMachine.ISOLATED, reason="Isolation Complete")
+                # Optional verification...
+                target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_CONFIRMED, confirmed=True)
             else:
+                target_fsm.isolate_immediately(reason="Quorum Kill Switch OS Block Failed (Fail-Closed Logical Isolation)")
+                target_fsm.record_kill_switch_state(MK1SafetyStateMachine.KS_OS_BLOCK_FAILED, confirmed=False)
+            return success
+        else:
+            if safe_score_a >= 0.95 or corrupted_scores:
                 _ISOLATION_APPROVAL_PENDING = True
-                log.error(
-                    "[ISOLATION] 脅威を検知しました。管理者承認（M-of-N）待ちのため隔離を保留中。"
-                )
-            return True
+                log.error("[ISOLATION] 脅威を検知しました。管理者承認（M-of-N）待ちのため隔離を保留中。")
+        return False
     return False
 
 
@@ -7936,20 +9167,41 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
         return {
             "block": True, "stage": "frame_length", "score": 1.0,
             "reason": "frame_exceeds_policy_limit",
+            "feature_vector": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         }
 
     if ONI_MODE_is_active():
         trace = build_diagnostic_trace(layer=1, threshold=0.01, score=1.0, reason="oni_mode")
-        return {"block": True, "stage": "oni", "score": 1.0, "reason": "ONI_MODE enabled", "diagnostic_trace": trace}
+        return {
+            "block": True, "stage": "oni", "score": 1.0, "reason": "ONI_MODE enabled", 
+            "diagnostic_trace": trace,
+            "feature_vector": [0.1, 0.1, 0.1, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        }
 
     # 1.2: Check blacklist BEFORE parser or DPI to minimize processing of known attackers
     src_ip = _extract_src_ip(packet_bytes)
     if _is_ip_blacklisted(src_ip):
         log_full_packet_inspection(packet_bytes, interface, {}, stage="blacklist", reason="source_ip_blacklisted")
-        return {"block": True, "stage": "blacklist", "score": 0.92, "reason": "source_blacklisted"}
+        return {
+            "block": True, "stage": "blacklist", "score": 0.92, "reason": "source_blacklisted",
+            "feature_vector": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        }
 
     # 1.1: Connect DPI results to blocking pipeline
     dpi_result = dpi_result or analyze_dpi_payload(packet_bytes, interface=interface)
+    dpi_score = float(dpi_result.get("score", 0.0))
+    
+    # 2.3: Initial feature vector construction (if not provided)
+    if feature_vector is None:
+        ent = calculate_entropy(packet_bytes)
+        feature_vector = [
+            min(1.0, len(packet_bytes) / 1500.0),
+            min(1.0, ent / 8.0),
+            dpi_score,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+            1.0 if dpi_result.get("fragmented") else 0.0
+        ]
+
     if dpi_result.get("scan_strategy") == "fail_closed":
         trace = build_diagnostic_trace(layer=2, threshold=1.0, score=1.0, reason="dpi_fail_closed")
         log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="dpi_fail_closed", reason="dpi_fail_closed")
@@ -7959,6 +9211,7 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
             "score": 1.0,
             "reason": "dpi_fail_closed",
             "diagnostic_trace": trace,
+            "feature_vector": feature_vector,
         }
 
     extracted_payload = extract_payload_bytes(packet_bytes)
@@ -7972,6 +9225,7 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
         return {
             "block": True, "stage": "signature", "score": 1.0,
             "reason": "fixed_payload_signature", "diagnostic_trace": trace,
+            "feature_vector": feature_vector,
         }
 
     # Handle suspicious DPI findings (P0 1.1) - AFTER deterministic signature check
@@ -7983,6 +9237,7 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
             "score": max(0.85, float(dpi_result.get("score", 0.0))),
             "reason": "dpi_suspicious_payload",
             "diagnostic_trace": trace,
+            "feature_vector": feature_vector,
         }
 
     dpi_attack_sigs = set(dpi_result.get("attack_signatures") or ())
@@ -8001,6 +9256,7 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
             "score": max(0.95, float(dpi_result.get("score", 1.0))),
             "reason": "dpi_attack_signature",
             "diagnostic_trace": trace,
+            "feature_vector": feature_vector,
         }
 
     # 1.2: Parser Fail-Closed and Progressive Defense correctly connected
@@ -8010,9 +9266,15 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
         if defense_decision.get("defer"):
             trace = build_diagnostic_trace(layer=4, threshold=0.8, score=0.98, reason="progressive_rate_limit")
             log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="parse_error", reason="packet_parse_error")
-            return {"block": True, "stage": "rate_limited", "score": 0.98, "reason": "parse_error_deferred", "diagnostic_trace": trace}
+            return {
+                "block": True, "stage": "rate_limited", "score": 0.98, "reason": "parse_error_deferred", 
+                "diagnostic_trace": trace, "feature_vector": feature_vector
+            }
         log_full_packet_inspection(packet_bytes, interface, dpi_result, stage="parse_error", reason="packet_parse_error")
-        return {"block": True, "stage": "parse_error", "score": 0.95, "reason": "parse_error"}
+        return {
+            "block": True, "stage": "parse_error", "score": 0.95, "reason": "parse_error",
+            "feature_vector": feature_vector
+        }
 
     markers = analyze_packet_security_markers(packet_bytes, interface=interface)
 
@@ -8060,10 +9322,12 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
                 "score": 0.95,
                 "reason": "invalid_feature_vector",
                 "diagnostic_trace": trace,
+                "feature_vector": [1.0] * 10, # Fail-closed
             }
         ai_score = min(0.99, max(0.0, 0.2 + 0.15 * max(feature_vector[:3]) + 0.1 * sum(feature_vector[3:8]) + 0.1 * feature_vector[9]))
+    
     if model is not None:
-        effective_fv = list(feature_vector) if feature_vector is not None else [0.0] * _ALLOWED_PACKET_FEATURE_LENGTH
+        effective_fv = list(feature_vector)
         # 2.3 & V3 5.2-5.4: Protected model inference with strict output & weight integrity validation
         ai_integrity_failure = False
         ai_integrity_reason = "clear"
@@ -8122,6 +9386,7 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
                 "reason": ai_integrity_reason,
                 "ai_integrity_failure": True,
                 "ai_scores": ai_scores,
+                "feature_vector": feature_vector,
                 "diagnostic_trace": trace,
             }
 
@@ -8151,6 +9416,7 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
             "score": overall_score,
             "reason": "ai_anomaly_threshold_exceeded",
             "diagnostic_trace": trace,
+            "feature_vector": feature_vector,
             "advisory": {
                 "ai_score": ai_score,
                 "math_score": math_score,
@@ -8167,6 +9433,7 @@ def inspect_packet_pipeline(packet_bytes: bytes, interface: str | None, model=No
         "reason": "advisory_scores_only",
         "ai_anomaly": ai_anomaly,
         "ai_scores": ai_scores if 'ai_scores' in locals() else {"score_a": ai_score, "score_b": 0.0, "score_c": 0.0},
+        "feature_vector": effective_fv if model is not None else (feature_vector or [0.0] * _ALLOWED_PACKET_FEATURE_LENGTH),
         "advisory": {
             "ai_score": ai_score,
             "math_score": math_score,
@@ -8204,7 +9471,9 @@ def handle_packet_event(packet_bytes: bytes, interface: str, dry_run: bool, dpi_
             score_c=ai_scores.get("score_c", 0.0),
             backdoor_detected=backdoor_detected,
             backdoor_boost=max(0.05, score * 0.15) if backdoor_detected else 0.0,
-            autonomous=True # Enabled by default for high-confidence threats in V3
+            autonomous=True, # Enabled by default for high-confidence threats in V3
+            packet_bytes=packet_bytes,
+            feature_vector=pipeline.get("feature_vector")
         )
         _publish_threat_map_event(packet_bytes, str(stage or "threat"), score)
         return blocked
@@ -9585,7 +10854,8 @@ def main():
             if pipeline.get("block"):
                 _LAST_THREAT_SCORE = max(_LAST_THREAT_SCORE, float(pipeline.get("score", 0.0)))
                 evaluate_threat_state(monitor_interface, dry_run, score_a=min(0.99, pipeline.get("score", 0.0)),
-                                     backdoor_detected=True, backdoor_boost=max(0.1, pipeline.get("score", 0.0)))
+                                     backdoor_detected=True, backdoor_boost=max(0.1, pipeline.get("score", 0.0)),
+                                     autonomous=True, packet_bytes=pkt, feature_vector=feat)
                 time.sleep(5)
                 continue
 
@@ -9804,7 +11074,15 @@ class SafetyExecutionLoop:
 
                 elif iterations == 3:
                     state = "STAGE_3_POLICY_COMMIT"
-                    if dpi_block or dpi_score >= 0.70:
+                    # V3.2: Use Hybrid Safety Supervisor for the final commit decision
+                    ai_report = {
+                        "threat_score": head_scores[0],
+                        "inference_status": "ok"
+                    }
+                    is_dangerous = _SAFETY_SUPERVISOR.evaluate_hybrid_threat(
+                        ai_report, packet_bytes, clean_feats, autonomous=True
+                    )
+                    if is_dangerous:
                         state = "FAIL_CLOSED_BLOCK"
                     else:
                         state = "TERMINATED"

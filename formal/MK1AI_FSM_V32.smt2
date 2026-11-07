@@ -27,7 +27,8 @@
 ; 0 = UNVERIFIED, 1 = VERIFIED, 2 = FAILED_HMAC, 3 = FAILED_ROLLBACK,
 ; 4 = FAILED_MISSING_STATE, 5 = FAILED_MISSING_JOURNAL, 6 = FAILED_STORAGE_WIPE,
 ; 7 = FAILED_STATE_MISMATCH, 8 = FAILED_JOURNAL_DESYNC, 9 = FAILED_PERSISTENCE,
-; 10 = FAILED_WAL_INCOMPLETE
+; 10 = FAILED_WAL_INCOMPLETE, 11 = FAILED_SEAL_MISSING, 12 = FAILED_SEAL_TAMPER,
+; 13 = FAILED_ANCHOR_DESYNC
 
 ; Action Kind Encoding:
 ; 0 = DRY_RUN
@@ -65,6 +66,9 @@
 (declare-const token_reserved Bool)
 (declare-const is_core_domain Bool)
 (declare-const boot_fail_closed Bool)
+(declare-const imse_danger Bool)
+(declare-const ai_corrupted Bool)
+
 
 ; Post-state variables
 (declare-const state_next Int)
@@ -87,7 +91,10 @@
 (declare-const token_reserved_next Bool)
 (declare-const is_core_domain_next Bool)
 (declare-const boot_fail_closed_next Bool)
+(declare-const imse_danger_next Bool)
+(declare-const ai_corrupted_next Bool)
 (declare-const audit_recorded_next Bool)
+
 
 (define-fun valid_state ((s Int)) Bool
   (and (>= s 0) (<= s 6)))
@@ -99,7 +106,7 @@
   (and (>= w 0) (<= w 2)))
 
 (define-fun valid_auth ((a Int)) Bool
-  (and (>= a 0) (<= a 10)))
+  (and (>= a 0) (<= a 13)))
 
 (define-fun allowed_transition ((s1 Int) (s2 Int)) Bool
   (or
@@ -124,10 +131,14 @@
 (assert (= max_gen gen))
 (assert (=> (and (= auth_status 1) (= wal_status 2))
             (and (= journal_gen gen) (= journal_state state))))
+(assert (=> (or (= auth_status 3) (= auth_status 10) (= auth_status 11) (= auth_status 12) (= auth_status 13) (= wal_status 1))
+            (= state 4)))
 (assert (=> (>= auth_status 2) (= state 4)))
 (assert (=> (or (= state 5) (= state 6))
             (and has_bound_event has_bound_challenge)))
-(assert (=> net_confirmed (and (= state 4) (= ks_status 4))))
+(assert (=> net_confirmed
+            (and (or (= state 4) (= state 5) (= state 6) (= state 1))
+                 (= ks_status 4))))
 (assert (=> (= ks_status 5) (not net_confirmed)))
 (assert (=> boot_fail_closed (= state 4)))
 (assert (not (and token_reserved token_already_consumed)))
@@ -162,7 +173,10 @@
     (= token_reserved_next token_reserved)
     (= is_core_domain_next is_core_domain)
     (= boot_fail_closed_next boot_fail_closed)
+    (= imse_danger_next imse_danger)
+    (= ai_corrupted_next ai_corrupted)
     (= audit_recorded_next true)
+
   ))
 
 ; Action 1: NORMAL_STEP (OFF -> ARMING -> ACTIVE -> OFF when no emergency_latch)
@@ -192,7 +206,10 @@
     (= token_reserved_next false)
     (= is_core_domain_next true)
     (= boot_fail_closed_next false)
+    (= imse_danger_next false)
+    (= ai_corrupted_next false)
     (= audit_recorded_next true)
+
   ))
 
 ; Action 2: P0_LATCH_TRIGGER (Lock-free atomic preemption latch & epoch increment)
@@ -219,6 +236,8 @@
     (= token_reserved_next token_reserved)
     (= is_core_domain_next is_core_domain)
     (= boot_fail_closed_next boot_fail_closed)
+    (= imse_danger_next true)
+    (= ai_corrupted_next ai_corrupted)
     (= audit_recorded_next true)
   ))
 
@@ -524,7 +543,7 @@
       (and (= journal_gen_next gen_next) (= journal_state_next state_next))))
 
 (define-fun Post_I08_RollbackAndIncompleteWALPrevention () Bool
-  (=> (or (= auth_status_next 3) (= auth_status_next 10) (= wal_status_next 1))
+  (=> (or (= auth_status_next 3) (= auth_status_next 10) (= auth_status_next 11) (= auth_status_next 12) (= auth_status_next 13) (= wal_status_next 1))
       (= state_next 4)))
 
 (define-fun Post_I09_EventAndChallengeBinding () Bool
@@ -544,7 +563,9 @@
   (=> boot_fail_closed_next (= state_next 4)))
 
 (define-fun Post_I14_KillSwitchConsistency () Bool
-  (and (=> net_confirmed_next (and (= state_next 4) (= ks_status_next 4)))
+  (and (=> net_confirmed_next
+           (and (or (= state_next 4) (= state_next 5) (= state_next 6) (= state_next 1))
+                (= ks_status_next 4)))
        (=> (= ks_status_next 5) (not net_confirmed_next))))
 
 (define-fun Post_I15_FailClosedIntegrity () Bool
@@ -564,8 +585,18 @@
   (=> (not (= state_next state)) audit_recorded_next))
 
 (define-fun Post_I20_SafetyOverAvailabilityPriority () Bool
-  (=> (or (= wal_status_next 1) (and emergency_latch_next (not (= action 2))))
-      (not (= state_next 2))))
+  (and
+    (=> (= wal_status_next 1) (not (= state_next 2)))
+    (=> (and (or emergency_latch emergency_latch_next)
+             (or (= action 1) (= action 4) (= action 5) (= action 6) (= action 7)))
+        (not (= state_next 2)))))
+
+(define-fun Post_I21_IMSEOverride () Bool
+  (=> (and imse_danger_next (= state_next 2)) emergency_latch_next))
+
+(define-fun Post_I22_QuorumNecessity () Bool
+  (=> (= action 2) (or imse_danger_next ai_corrupted_next)))
+
 
 (assert
   (not
@@ -590,6 +621,9 @@
       Post_I18_EventReusePrevention
       Post_I19_TransitionAuditability
       Post_I20_SafetyOverAvailabilityPriority
+      Post_I21_IMSEOverride
+      Post_I22_QuorumNecessity
     )))
+
 
 (check-sat)
